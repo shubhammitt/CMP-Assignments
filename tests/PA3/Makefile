@@ -26,3 +26,4 @@ dummy:
 
 clean:
 	rm -f *.bc *.s *.ll $(TARGETS) *.o dummy
+	cd ../../support/SafeGC/ && make clean
