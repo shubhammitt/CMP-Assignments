@@ -57,9 +57,79 @@ static bool isLibraryCall(const CallInst *CI, const TargetLibraryInfo *TLI)
 	}
 	return false;
 }
+bool DEBUG = true;
+
+void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
+	
+	for (BasicBlock &BB : F) {
+		for (Instruction &I : BB) {
+			
+			// if alloca then find its users
+			if(dyn_cast<AllocaInst>(&I)){
+				
+				if(DEBUG)
+					errs() << "\n\n***************** " << I << "****\n";
+				
+				std::deque<Instruction*> q;
+				q.push_back(&I);
+
+				bool isPassedToRoutine = false;
+				bool isStoredInMemory = false;
+
+				while(not q.empty()){
+					
+					Instruction *InstPopped = q.front();
+					q.pop_front();
+
+					for (auto *U : InstPopped -> users()) {
+						
+						auto *CI = dyn_cast<CallInst>(U);
+						if (CI && not isLibraryCall(dyn_cast<CallInst>(U), TLI)) {
+							
+							if(DEBUG)
+								errs() << *CI << " breaking...";
+
+							isPassedToRoutine = true;
+							break;
+						}
+
+						auto *SI = dyn_cast<StoreInst>(U);
+						if(SI && SI -> getValueOperand() -> getType() -> isPointerTy()) {
+
+							if(DEBUG) {
+								errs() << *SI << " breaking...";
+							}
+
+							isStoredInMemory = true;
+							break;
+						}
+						
+						auto *Inst = dyn_cast<Instruction>(U);
+						if(Inst) {
+							
+							q.push_back(Inst);
+							
+							if(DEBUG)
+								errs() << *Inst << "  pushed in deque\n";
+						}
+					}
+				}
+
+				if(DEBUG){
+					errs() << "\nAlloca requires conversion?: " << ((isPassedToRoutine || isStoredInMemory)?"Yes":"No") << "\n\n\n";
+				}
+
+				if(isPassedToRoutine || isStoredInMemory) {
+					
+				}	
+			}
+		}
+	}
+}
 
 bool MemSafe::runOnFunction(Function &F) {
 	TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
+	convertAllocaToMyMalloc(F, TLI);
   return true;
 }
 
