@@ -61,11 +61,16 @@ bool DEBUG = true;
 
 void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 	
+	const DataLayout &DL = F.getParent()->getDataLayout();
+
+	std::set<Instruction*> instructionsToDelete;
+
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
 			
 			// if alloca then find its users
-			if(dyn_cast<AllocaInst>(&I)){
+			auto *AI = dyn_cast<AllocaInst>(&I);
+			if(AI){
 				
 				if(DEBUG)
 					errs() << "\n\n***************** " << I << "****\n";
@@ -115,15 +120,46 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 					}
 				}
 
-				if(DEBUG){
+				if(DEBUG)
 					errs() << "\nAlloca requires conversion?: " << ((isPassedToRoutine || isStoredInMemory)?"Yes":"No") << "\n\n\n";
-				}
 
 				if(isPassedToRoutine || isStoredInMemory) {
-					
+
+					BasicBlock::iterator ii(AI);
+					IRBuilder<> IRB(&I);
+
+					if(AI->getAllocationSizeInBits(DL)) { // Not VLA
+
+						uint64_t bytesAllocated = (*AI->getAllocationSizeInBits(DL)) / 8;
+						
+						if(DEBUG)
+							errs() << "Size Allocated by Alloca: " << bytesAllocated << "\n";
+
+						auto Fn = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), IRB.getInt64Ty());
+						// ReplaceInstWithInst(AI->getParent()->getInstList(), ii, CallInst::Create(Fn,  {ConstantInt::get(IRB.getInt64Ty(), bytesAllocated)}));
+						auto *callInst = IRB.CreateCall(Fn, {ConstantInt::get(IRB.getInt64Ty(), bytesAllocated)});
+						
+						AI->replaceAllUsesWith(callInst);
+						
+					}
+					else {
+						// VLA alloca
+						auto Fn = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), AI -> getOperand(0) -> getType());
+
+						auto *callInst = IRB.CreateCall(Fn, {AI -> getOperand(0)});
+						
+						AI->replaceAllUsesWith(callInst);
+
+					}
+				
+					instructionsToDelete.insert(&I);
 				}	
 			}
 		}
+	}
+
+	for(auto &I: instructionsToDelete){
+		I -> eraseFromParent();
 	}
 }
 
