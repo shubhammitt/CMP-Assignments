@@ -64,6 +64,7 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 	const DataLayout &DL = F.getParent()->getDataLayout();
 
 	std::set<Instruction*> instructionsToDelete;
+	std::set<BasicBlock*> BBWithAllocConverted;
 
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
@@ -124,8 +125,7 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 					errs() << "\nAlloca requires conversion?: " << ((isPassedToRoutine || isStoredInMemory)?"Yes":"No") << "\n\n\n";
 
 				if(isPassedToRoutine || isStoredInMemory) {
-
-					BasicBlock::iterator ii(AI);
+					
 					IRBuilder<> IRB(&I);
 
 					if(AI->getAllocationSizeInBits(DL)) { // Not VLA
@@ -135,20 +135,38 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 						if(DEBUG)
 							errs() << "Size Allocated by Alloca: " << bytesAllocated << "\n";
 
-						auto Fn = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), IRB.getInt64Ty());
+						auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), IRB.getInt64Ty());
 						// ReplaceInstWithInst(AI->getParent()->getInstList(), ii, CallInst::Create(Fn,  {ConstantInt::get(IRB.getInt64Ty(), bytesAllocated)}));
-						auto *callInst = IRB.CreateCall(Fn, {ConstantInt::get(IRB.getInt64Ty(), bytesAllocated)});
+						auto *callInstMalloc = IRB.CreateCall(FnMalloc, {ConstantInt::get(IRB.getInt64Ty(), bytesAllocated)});
 						
-						AI->replaceAllUsesWith(callInst);
+						AI->replaceAllUsesWith(callInstMalloc);
+
+						auto FnFree = F.getParent()->getOrInsertFunction("myfree", Type::getVoidTy(F.getContext()), callInstMalloc->getType());
+
+						// auto *myBB = callInstMalloc -> getParent();
+
+						// while(myBB -> getNextNode()){
+						// 	errs() << "next\n";
+						// 	myBB = myBB -> getNextNode();
+						// }
+						// IRBuilder<> IRBLastBlock(myBB);
+						// IRBLastBlock.CreateCall(FnFree, {callInstMalloc});						
 						
 					}
 					else {
 						// VLA alloca
-						auto Fn = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), AI -> getOperand(0) -> getType());
 
-						auto *callInst = IRB.CreateCall(Fn, {AI -> getOperand(0)});
+						auto sizeOfTypeAllocated = DL.getTypeAllocSize(AI->getAllocatedType());
 						
-						AI->replaceAllUsesWith(callInst);
+						auto ObjSize = IRB.CreateNSWMul(llvm::ConstantInt::get(llvm::Type::getInt64Ty(F.getContext()), sizeOfTypeAllocated), AI->getOperand(0));
+
+						auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), ObjSize -> getType());
+
+						auto *callInstMalloc = IRB.CreateCall(FnMalloc, {ObjSize});
+						
+						AI->replaceAllUsesWith(callInstMalloc);
+
+						auto FnFree = F.getParent()->getOrInsertFunction("myfree", Type::getVoidTy(F.getContext()), callInstMalloc->getType());
 
 					}
 				
