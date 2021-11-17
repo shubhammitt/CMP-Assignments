@@ -80,6 +80,7 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 	 * will be stored in this set and will be deleted at the very last.
 	 */
 	std::set<Instruction*> instructionsToDelete;
+	std::set<Instruction*> callInstructionsInserted;
 
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
@@ -152,6 +153,8 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 						auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), IRB.getInt64Ty());
 						auto *callInstMalloc = IRB.CreateCall(FnMalloc, {ConstantInt::get(IRB.getInt64Ty(), bytesAllocated)});
 						AI->replaceAllUsesWith(callInstMalloc);
+						callInstructionsInserted.insert(callInstMalloc);
+						
 						// auto FnFree = F.getParent()->getOrInsertFunction("myfree", Type::getVoidTy(F.getContext()), callInstMalloc->getType());						
 					}
 					else {
@@ -162,7 +165,6 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 						auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), ObjSize -> getType());
 						auto *callInstMalloc = IRB.CreateCall(FnMalloc, {ObjSize});
 						AI->replaceAllUsesWith(callInstMalloc);
-						// auto FnFree = F.getParent()->getOrInsertFunction("myfree", Type::getVoidTy(F.getContext()), callInstMalloc->getType());
 					}
 					instructionsToDelete.insert(&I);
 				}	
@@ -171,6 +173,18 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 	}
 
 	for(auto &I: instructionsToDelete)	I -> eraseFromParent();
+
+	for(auto *callInstMalloc: callInstructionsInserted){
+		auto *myBB = callInstMalloc -> getParent();
+		while(myBB -> getNextNode()){
+			myBB = myBB -> getNextNode();
+			errs() << "yeah\n";
+		}
+		Instruction *lastInstruction = &(myBB->back());
+		auto FnFree = F.getParent()->getOrInsertFunction("myfree", Type::getVoidTy(F.getContext()), callInstMalloc->getType());
+		IRBuilder<> IRBLastBlock(lastInstruction);
+		IRBLastBlock.CreateCall(FnFree, {callInstMalloc});
+	}
 }
 
 bool MemSafe::runOnFunction(Function &F) {
