@@ -104,7 +104,7 @@ bool isAllocaToMallocRequired(AllocaInst* AI, Function &F, const TargetLibraryIn
 				break;
 			}
 							
-			if(auto *Inst = dyn_cast<Instruction>(U)) { 		// TODO: What about branch instructions?
+			if(auto *Inst = dyn_cast<Instruction>(U)) { 		// Fixme: What about branch instructions?
 				
 				q.push_back(Inst);
 				
@@ -144,7 +144,6 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 		}
 	}
 
-
 	/*
 	 * DataLayout is required to find size allocated by Alloca Instruction.
 	 * 		- for VLA -> we need it to get the size of type allocated
@@ -157,21 +156,15 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 	 * 						 will give the size allocated on stack by alloca
 	 */
 	const DataLayout &DL = F.getParent()->getDataLayout();
-
-	/*
-	 * Since alloca instructions which need conversion to mymalloc call
-	 * cannot be deleted side-by-side while iterating on instruction, they
-	 * will be stored in this set and will be deleted afterwards
-	 */
-	std::set<AllocaInst*> instructionsToDelete;
 	
 	/*
 	 * myFree need to pass argument given by the mymalloc call instruction inserted
 	 */
-	std::set<CallInst*> callInstructionsInsertedNonVLA;
+	std::set<CallInst*> callInstructionsInsertedForNonVLA_Alloca;
+	std::set<CallInst*> callInstructionsInsertedForVLA_Alloca;
 
 	for(auto &AI: allocaInstructionsToBeConverted){
-		
+
 		if(DEBUG)
 			errs() << "Converting Alloca to mymalloc: " << *AI << "\n";
 
@@ -180,37 +173,56 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 		// check if current Alloca Instruction is VLA Alloca or not
 		if(AI -> getAllocationSizeInBits(DL)) { 					// Not VLA Alloca	
 
-			uint64_t bytesAllocated = (*AI->getAllocationSizeInBits(DL)) / 8;
-			
-			if(DEBUG)
-				errs() << "It is Not VLA Alloca so size Allocated by Alloca: " << bytesAllocated << "\n";
+			size_t bytesAllocated = (*AI->getAllocationSizeInBits(DL)) / 8;
 
-			auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), IRB.getInt64Ty());
-			CallInst *callInstMalloc = IRB.CreateCall(FnMalloc, {ConstantInt::get(IRB.getInt64Ty(), bytesAllocated)});
-			AI->replaceAllUsesWith(callInstMalloc);
-			callInstructionsInsertedNonVLA.insert(callInstMalloc);	
+			if(DEBUG)
+				errs() << "It is Not VLA Alloca, so size Allocated by Alloca: " << bytesAllocated << "\n";
+
+			auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), Type::getInt64Ty(F.getContext())); // Fixeme: getType should be void* so bitcast is required from void* to alloca->getTpye
+			auto *FI = CallInst::Create(FnMalloc, ConstantInt::get(Type::getInt64Ty(F.getContext()), bytesAllocated, false));
+			ReplaceInstWithInst(AI, FI);
+			callInstructionsInsertedForNonVLA_Alloca.insert(FI);
 		}
 		else {														// it is VLA Alloca
-			
+
 			auto sizeOfTypeAllocated = DL.getTypeAllocSize(AI->getAllocatedType());
-			auto ObjSize = IRB.CreateMul( AI->getOperand(0), llvm::ConstantInt::get(llvm::Type::getInt64Ty(F.getContext()), \
-							sizeOfTypeAllocated));
+			Value *ObjSize = IRB.CreateMul( AI->getOperand(0), llvm::ConstantInt::get(llvm::Type::getInt64Ty(F.getContext()), sizeOfTypeAllocated));
 			auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), ObjSize -> getType());
-			CallInst *callInstMalloc = IRB.CreateCall(FnMalloc, {ObjSize});
-			AI->replaceAllUsesWith(callInstMalloc);
-		}
-		instructionsToDelete.insert(AI);	
+			auto *FI = CallInst::Create(FnMalloc, ObjSize);
+			ReplaceInstWithInst(AI, FI);
+			callInstructionsInsertedForVLA_Alloca.insert(FI);
+		}	
 	}
 
-	for(auto &I: instructionsToDelete)	I -> eraseFromParent();
+	/*
+	 * Insert myFree corresponding to mymalloc for NonVLA Alloca
+	 */
+	for(auto *callInstMalloc: callInstructionsInsertedForNonVLA_Alloca){
+		Instruction *lastInstruction = &(F.back().back());
+		auto FnFree = F.getParent()->getOrInsertFunction("myfree", Type::getVoidTy(F.getContext()), callInstMalloc->getType());
+		IRBuilder<> IRB(lastInstruction);
+		IRB.CreateCall(FnFree, {callInstMalloc});
+	}
 
-	// for(auto *callInstMalloc: callInstructionsInsertedNonVLA){
-	// 	auto *myBB = &F.back();
-	// 	Instruction *lastInstruction = &(myBB->back());
-	// 	auto FnFree = F.getParent()->getOrInsertFunction("myfree", Type::getVoidTy(F.getContext()), callInstMalloc->getType());
-	// 	IRBuilder<> IRBLastBlock(lastInstruction);
-	// 	IRBLastBlock.CreateCall(FnFree, {callInstMalloc});
-	// }
+	/*
+	 * Insert myFree corresponding to mymalloc for VLA Alloca
+	 */
+	for (BasicBlock &BB : F) {
+		for (Instruction &I : BB) {
+			
+			CallInst *CI = dyn_cast<CallInst>(&I);
+			if(CI && CI->getCalledFunction() && CI->getCalledFunction()->getName() == "llvm.stackrestore"){
+				
+				for(auto callInstMalloc: callInstructionsInsertedForVLA_Alloca) {
+					auto FnFree = F.getParent()->getOrInsertFunction("myfree", Type::getVoidTy(F.getContext()), callInstMalloc->getType());
+					IRBuilder<> IRB(&I);
+					IRB.CreateCall(FnFree, {callInstMalloc});
+				}
+				
+				return;	
+			}
+		}
+	}
 }
 
 bool MemSafe::runOnFunction(Function &F) {
