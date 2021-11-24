@@ -186,12 +186,13 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 			if(DEBUG)
 				errs() << "It is Non-VLA Alloca, so size Allocated by Alloca: " << bytesAllocated << "\n";
 
-			auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", AI->getType(), \
+			auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", FunctionType::getInt8PtrTy(F.getContext()), \
 							Type::getInt64Ty(F.getContext())); // Fixeme: getType should be void* so bitcast is required from void* to alloca->getTpye
 			
 			auto *FI = CallInst::Create(FnMalloc, ConstantInt::get(Type::getInt64Ty(F.getContext()), \
-													bytesAllocated, false));
-			ReplaceInstWithInst(AI, FI);
+													bytesAllocated, false), "", AI);
+			auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , FI, AI->getType());
+			ReplaceInstWithInst(AI, BI);
 			callInstructionsInsertedForNonVLA_Alloca.insert(FI);
 		}
 		else {														// it is VLA Alloca
@@ -202,11 +203,11 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 				llvm::ConstantInt::get(llvm::Type::getInt64Ty(F.getContext()), sizeOfTypeAllocated));
 			
 			auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", \
-							AI->getType(), ObjSize -> getType());
+							FunctionType::getInt8PtrTy(F.getContext()), ObjSize -> getType());
 			
-			auto *FI = CallInst::Create(FnMalloc, ObjSize);
-			
-			ReplaceInstWithInst(AI, FI);
+			auto *FI = CallInst::Create(FnMalloc, ObjSize, "", AI);
+			auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , FI, AI->getType());
+			ReplaceInstWithInst(AI, BI);
 			callInstructionsInsertedForVLA_Alloca.insert(FI);
 		}	
 	}
