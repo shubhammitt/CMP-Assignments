@@ -246,7 +246,7 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 
 void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 	
-	std::set<std::pair<Value*, Value*>> pointersToTrack;
+	std::set<std::pair<Value*, Value*>> pointersToTrack; // (ptr, Instruction above which check is needed)
 
 	if(DEBUG){
 		errs() << "\n\n************************\nAfter myfree insertion" << "\n";
@@ -291,69 +291,62 @@ void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 			}
 
 			StoreInst *SI = dyn_cast<StoreInst>(&I);
-			if(SI && SI->getOperand(0)->getType()->isPointerTy()){
+			if(SI){
 
-				if(DEBUG) {
-					errs() << "\nStore Instruction with pointer stored: " << *SI << "\n";
-					errs() << "Track this pointer: " << *SI->getOperand(1) << "\n";
+				if(SI->getOperand(0)->getType()->isPointerTy()) {
+					if(DEBUG) {
+						errs() << "\nStore Instruction with pointer stored: " << *SI << "\n";
+						errs() << "Track this pointer: " << *SI->getOperand(0) << "\n";
+					}
+
+					pointersToTrack.insert({SI->getOperand(0), SI});
 				}
-
-				pointersToTrack.insert({SI->getOperand(1), SI});
 
 			}
 		}
 	}
 
-	std::set<std::pair<Value*, std::pair<Value*, Value*>>> basePointers;
-	// now backtrack for each pointer
 	for(std::pair<Value*, Value*> ptr_Inst: pointersToTrack){
 		
-		auto ptr = ptr_Inst.first;
+		auto *ptr = ptr_Inst.first;
+		Instruction *insertBefore = dyn_cast<Instruction>(ptr_Inst.second);
 
 		if(DEBUG)
 			errs() << "\n\nBackTracking: " << *ptr << "\n";
-		std::deque<Value*> q;
-		q.push_back(ptr);
-		while(not q.empty()){
-			auto *poppedInstr = q.front();
-			q.pop_front();
-			errs() << *poppedInstr << "\n";
 
-			for(auto &U: poppedInstr->uses()){
-				auto *Inst = dyn_cast<Instruction>(U);
-				if(Inst){
-					
-					if(auto *BI = dyn_cast<BitCastInst>(Inst)){
-						q.push_back(BI->getOperand(0));
-					}
-					else if(auto *GEPI = dyn_cast<GetElementPtrInst>(Inst)){
-						q.push_back(GEPI->getOperand(0));
-					}
-					else{
-						q.clear();
-						if(poppedInstr == ptr){
-							if (DEBUG)
-								errs() << "Not required check" << "\n";
-							break;
-						}
-						basePointers.insert({poppedInstr, ptr_Inst});
-					}
-				}
+		while(true){
+			if(auto *BI = dyn_cast<BitCastInst>(ptr)){
+				ptr = BI -> getOperand(0);
 			}
+			else if(auto *GI = dyn_cast<GetElementPtrInst>(ptr)){
+				ptr = GI -> getOperand(0);
+			}
+			else
+				break;
+			if(DEBUG)
+				errs() << *ptr << "\n";
 		}
-	}
-	for(auto ptrs: basePointers){
-		auto basePtr = ptrs.first;
-		auto ptrOutOfBound = ptrs.second.first;
-		auto InstNeedCheck = ptrs.second.second;
-		errs() << "All 3 ready: " << *basePtr << " " << *ptrOutOfBound << " " << *InstNeedCheck << "\n";
+
+		if(DEBUG)
+			errs() << "Base Ptr: " << *ptr << "\n";
+		
+		if(ptr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
+			ptr = BitCastInst::Create(Instruction::CastOps::BitCast , ptr, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
+		}
+		auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
+		
+		auto EscapeFn = F.getParent()->getOrInsertFunction("IsSafeToEscape", FunctionType::getVoidTy(F.getContext()) ,\
+							ptr->getType(), BI -> getType() );
+			
+		CallInst::Create(EscapeFn, {ptr, BI}, "", insertBefore);
+
 	}
 }
 
 bool MemSafe::runOnFunction(Function &F) {
 	TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
 	convertAllocaToMyMalloc(F, TLI);
-	// insertCheckForOutOfBoundPointer(F, TLI);
+	insertCheckForOutOfBoundPointer(F, TLI);
   return true;
 }
 

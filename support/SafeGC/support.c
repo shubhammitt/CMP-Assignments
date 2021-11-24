@@ -37,6 +37,15 @@ void* mycast(void *Ptr, unsigned long long Bitmap, unsigned Size)
 
 void IsSafeToEscape(void *Base, void *Ptr)
 {
+	ObjHeader *objHeader = getObjectHeader((char*)Base);
+	// printf("%llu\n", objHeader->Type);
+	int objSize = objHeader->Size - OBJ_HEADER_SIZE;
+	char *objStart = (char*)objHeader + OBJ_HEADER_SIZE;
+	// printf("%p %p %ld %p %d\n", objStart, Ptr, (char*)Ptr - objStart, (objStart + objSize), objSize);
+	if((char*)Ptr < objStart || (((char*)Ptr) >= (objStart + objSize))){
+		printf("Disallowing out-of-bounds pointers\n");
+		exit(0);
+	}
 }
 
 void BoundsCheck(void *Base, void *Ptr, size_t AccessSize)
