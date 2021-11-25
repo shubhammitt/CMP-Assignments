@@ -69,11 +69,43 @@ void BoundsCheckWithSize(void *RealBase, void *Ptr, size_t Size, size_t AccessSi
 	}
 }
 
-void WriteBarrier(void *Base, void *Ptr, size_t AccessSize)
-{
+int findPosLastSetBit(unsigned long long Type){
+	int count = 0;
+	while(Type){
+		Type >>= 1;
+		count++;
+	}
+	return count - 1;
+
 }
 
 void WriteBarrierWithSize(void *RealBase, void *Ptr, size_t Size,
 	size_t AccessSize, unsigned long long Type)
 {
+	// printf("Hello  %lu %lu %lu %llu\n",Ptr - RealBase, Size, AccessSize, Type);
+	if(Type == 0)
+		return;
+	
+	int numFields = findPosLastSetBit(Type);
+	Type = Type ^ (1ULL << numFields); // unset MSB
+
+	int fieldNum = 0;
+	for(void *i = RealBase ; i < RealBase + Size - 8 ; i += 8, fieldNum = (fieldNum + 1) % numFields){
+		// printf("%lu %d %llu %llu\n", i - RealBase, fieldNum, Type, Type &(1<<fieldNum));
+		if((Type & (1ULL << fieldNum)) != 0 && !((Ptr + AccessSize <= i) || (i + 8 <= Ptr))){
+			if((*(int64_t*)i) && ! getObjectHeader((char*)(*(int64_t*)i))){
+				printf("Write-Barrier\n");
+				exit(0);
+			}
+		}
+	}
+
+}
+
+void WriteBarrier(void *Base, void *Ptr, size_t AccessSize)
+{
+	ObjHeader *objHeader = getObjectHeader((char*)Base);
+	int objSize = objHeader->Size - OBJ_HEADER_SIZE;
+	char *objStart = (char*)objHeader + OBJ_HEADER_SIZE;
+	WriteBarrierWithSize((void*)objStart, Ptr, objSize, AccessSize, objHeader->Type);
 }

@@ -452,8 +452,24 @@ int readArgv(const char* argv[], int idx)
 	return atoi(argv[idx]);
 }
 
+int isPresentInSegmentList(char *addr) {
+	
+	SegmentList *head = Segments;
+	
+	while (head) {
+		
+		if (getDataPtr(head -> Segment) <= addr && addr <= getAllocPtr(head -> Segment))
+			return 1;
+		
+		head = head -> Next;
+	}
+	return 0;
+}
+
 ObjHeader* getObjectHeader(char *addr) {
 
+	if(isPresentInSegmentList(addr) == 0)
+		return NULL;
 	if (getBigAlloc(ADDR_TO_SEGMENT(addr))) {	/* Find objectHeader for bigAlloc */
 
 		char *myPage = ADDR_TO_PAGE(addr);
