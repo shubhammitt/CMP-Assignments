@@ -50,10 +50,23 @@ void IsSafeToEscape(void *Base, void *Ptr)
 
 void BoundsCheck(void *Base, void *Ptr, size_t AccessSize)
 {
+	ObjHeader *objHeader = getObjectHeader((char*)Base);
+	// printf("%llu\n", objHeader->Type);
+	int objSize = objHeader->Size - OBJ_HEADER_SIZE;
+	char *objStart = (char*)objHeader + OBJ_HEADER_SIZE;
+	// printf("%p %p %ld %p %d\n", objStart, Ptr, (char*)Ptr - objStart, (objStart + objSize), objSize);
+	if((char*)Ptr < objStart || (((char*)Ptr + AccessSize - 1) >= (objStart + objSize))){
+		printf("Adding BoundsCheck\n");
+		exit(0);
+	}
 }
 
 void BoundsCheckWithSize(void *RealBase, void *Ptr, size_t Size, size_t AccessSize)
 {
+	if(Ptr < RealBase || ((Ptr + AccessSize - 1) >= (RealBase + Size))){
+		printf("Adding BoundsCheck\n");
+		exit(0);
+	}
 }
 
 void WriteBarrier(void *Base, void *Ptr, size_t AccessSize)

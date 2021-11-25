@@ -247,16 +247,7 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 	
 	std::set<std::pair<Value*, Value*>> pointersToTrack; // (ptr, Instruction above which check is needed)
-
-	if(DEBUG){
-		errs() << "\n\n************************\nAfter myfree insertion" << "\n";
-		for (BasicBlock &BB : F) {
-			for (Instruction &I : BB) {
-				errs() << I << "\n";
-			}
-		}
-	}
-
+	
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
 			
@@ -293,6 +284,7 @@ void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 			StoreInst *SI = dyn_cast<StoreInst>(&I);
 			if(SI){
 
+				// TODO: track source or dst operand?
 				if(SI->getOperand(0)->getType()->isPointerTy()) {
 					if(DEBUG) {
 						errs() << "\nStore Instruction with pointer stored: " << *SI << "\n";
@@ -305,7 +297,7 @@ void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 			}
 		}
 	}
-
+	
 	for(std::pair<Value*, Value*> ptr_Inst: pointersToTrack){
 		
 		auto *ptr = ptr_Inst.first;
@@ -343,10 +335,166 @@ void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 	}
 }
 
+void addBoundsCheck(Function &F, const TargetLibraryInfo *TLI){
+	
+	if(DEBUG){
+		errs() << "\n\n**********************************************\nAfter Out Of Bound Pointer insertion" << "\n";
+		for (BasicBlock &BB : F) {
+			for (Instruction &I : BB) {
+				errs() << I << "\n";
+			}
+		}
+	}
+
+	errs() << "\n\n\n\n\n\n\n Pointers To Track*********\n";
+
+	std::set<std::pair<Value*, Value*>> pointersToTrack; // (ptr, Instruction above which check is needed)
+
+	for (BasicBlock &BB : F) {
+		for (Instruction &I : BB) {
+			if(auto *SI = dyn_cast<StoreInst> (&I)){
+				if(DEBUG)
+					errs() << *SI << "\n";
+				pointersToTrack.insert({SI->getOperand(1), SI});
+			}
+			
+			if(auto *LI = dyn_cast<LoadInst> (&I)){
+				if(DEBUG)
+					errs() << *LI << "\n";
+				pointersToTrack.insert({LI->getOperand(0), LI});
+			}	
+		}
+	}
+
+	const DataLayout &DL = F.getParent()->getDataLayout();
+
+	for(std::pair<Value*, Value*> ptr_Inst: pointersToTrack){
+		
+		auto *ptr = ptr_Inst.first;
+		Instruction *insertBefore = dyn_cast<Instruction>(ptr_Inst.second);
+
+		if(DEBUG)
+			errs() << "\n\nBackTracking: " << *ptr << "\n";
+
+		while(true){
+			if(auto *BI = dyn_cast<BitCastInst>(ptr)){
+				ptr = BI -> getOperand(0);
+			}
+			else if(auto *GI = dyn_cast<GetElementPtrInst>(ptr)){
+				ptr = GI -> getOperand(0);
+			}
+			else
+				break;
+			if(DEBUG)
+				errs() << *ptr << "\n";
+		}
+
+		if(DEBUG)
+			errs() << "Base Ptr: " << *ptr << "\n";
+		
+		StoreInst *SI = dyn_cast<StoreInst>(ptr_Inst.second);
+		if(auto *AI = dyn_cast<AllocaInst>(ptr)){
+			// alloca
+			if(AI->getAllocationSizeInBits(DL)){
+				// NON VLA alloca
+				size_t Size = (*AI->getAllocationSizeInBits(DL)) / 8;
+				if(ptr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
+					ptr = BitCastInst::Create(Instruction::CastOps::BitCast , ptr, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
+				}
+				
+				auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
+				
+				size_t accessSize = 0;
+				if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
+					accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
+				else
+					accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
+
+				auto BoundFn = F.getParent()->getOrInsertFunction("BoundsCheckWithSize", FunctionType::getVoidTy(F.getContext()) ,\
+									ptr->getType(), BI -> getType(), Type::getInt64Ty(F.getContext()), Type::getInt64Ty(F.getContext()));
+					
+				CallInst::Create(BoundFn, {ptr, BI, ConstantInt::get(Type::getInt64Ty(F.getContext()), Size, false), ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false)}, "", insertBefore);
+			}
+			else{
+				// VLA Alloca
+				IRBuilder<> IRB(AI);
+				auto sizeOfTypeAllocated = DL.getTypeAllocSize(AI->getAllocatedType());
+			
+				Value *ObjSize = IRB.CreateMul( AI->getOperand(0), \
+					llvm::ConstantInt::get(llvm::Type::getInt64Ty(F.getContext()), sizeOfTypeAllocated));
+				
+
+				if(ptr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
+					ptr = BitCastInst::Create(Instruction::CastOps::BitCast , ptr, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
+				}
+				
+				auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
+				
+				size_t accessSize = 0;
+				if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
+					accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
+				else
+					accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
+
+				auto BoundFn = F.getParent()->getOrInsertFunction("BoundsCheckWithSize", FunctionType::getVoidTy(F.getContext()) ,\
+									ptr->getType(), BI -> getType(), ObjSize->getType(), Type::getInt64Ty(F.getContext()));
+					
+				CallInst::Create(BoundFn, {ptr, BI, ObjSize, ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false)}, "", insertBefore);
+			}
+		}
+		else if(SI and isa<GEPOperator>(ptr)){
+			// global ptr
+			auto *gepOperator = dyn_cast<GEPOperator>(ptr);
+			ptr = gepOperator -> getOperand(0);
+			errs() << *ptr <<" fuck!\n";
+			IRBuilder<> IRB(SI);
+			auto sizeOfTypeAllocated = DL.getTypeAllocSize(gepOperator->getOperand(0)->getType());
+
+			if(ptr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
+				ptr = BitCastInst::Create(Instruction::CastOps::BitCast , ptr, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
+			}
+			
+			auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
+			
+			size_t accessSize = 0;
+			if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
+				accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
+			else
+				accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
+
+			auto BoundFn = F.getParent()->getOrInsertFunction("BoundsCheckWithSize", FunctionType::getVoidTy(F.getContext()) ,\
+								ptr->getType(), BI -> getType(), Type::getInt64Ty(F.getContext()), Type::getInt64Ty(F.getContext()));
+				
+			CallInst::Create(BoundFn, {ptr, BI, ConstantInt::get(Type::getInt64Ty(F.getContext()), sizeOfTypeAllocated, false), ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false)}, "", insertBefore);
+		
+		}
+		else{
+			if(ptr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
+				ptr = BitCastInst::Create(Instruction::CastOps::BitCast , ptr, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
+			}
+			
+			auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
+			
+			size_t accessSize = 0;
+			if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
+				accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
+			else
+				accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
+
+			auto BoundFn = F.getParent()->getOrInsertFunction("BoundsCheck", FunctionType::getVoidTy(F.getContext()) ,\
+								ptr->getType(), BI -> getType(), Type::getInt64Ty(F.getContext()));
+				
+			CallInst::Create(BoundFn, {ptr, BI, ConstantInt::get(Type::getInt64Ty(F.getContext()), \
+														accessSize, false)}, "", insertBefore);
+		}
+	}
+}
+
 bool MemSafe::runOnFunction(Function &F) {
 	TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
 	convertAllocaToMyMalloc(F, TLI);
 	insertCheckForOutOfBoundPointer(F, TLI);
+	addBoundsCheck(F, TLI);
   return true;
 }
 
