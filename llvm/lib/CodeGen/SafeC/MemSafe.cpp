@@ -263,154 +263,59 @@ void addBoundsCheck(Function &F, const TargetLibraryInfo *TLI){
 		
 		auto *basePtr = findBasePtr(ptr_Inst.first);
 		Instruction *insertBefore = dyn_cast<Instruction>(ptr_Inst.second);
+		bool needBoundCheckWithSize = true;
 		
-		StoreInst *SI = dyn_cast<StoreInst>(ptr_Inst.second);
+		Value *bytesAllocated = NULL;
 		if(auto *AI = dyn_cast<AllocaInst>(basePtr)){
 
-			if(not IsAllocaInstVLA(AI, DL)){
-
-				size_t Size = *AI->getAllocationSizeInBits(DL) / 8;
-				if(basePtr -> getType() != FunctionType::getInt8PtrTy(F.getContext()))
-					basePtr = BitCastInst::Create(Instruction::CastOps::BitCast,
-												basePtr,
-												FunctionType::getInt8PtrTy(F.getContext()),
-												"", insertBefore);
-				
-				auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast,
-											ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()),
-											"", insertBefore);
-				
-				size_t accessSize = 0;
-
-				if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
-					accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
-				else
-					accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
-
-				auto BoundFn = F.getParent()->getOrInsertFunction("BoundsCheckWithSize",
-																FunctionType::getVoidTy(F.getContext()),
-																basePtr->getType(),
-																BI -> getType(),
-																Type::getInt64Ty(F.getContext()),
-																Type::getInt64Ty(F.getContext()));
-					
-				CallInst::Create(BoundFn, 
-								{
-									basePtr, 
-									BI, 
-									ConstantInt::get(Type::getInt64Ty(F.getContext()), Size, false), 
-									ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false)
-								},
-								"", insertBefore);
-			}
-			else{
-
-				IRBuilder<> IRB(AI);
-				auto sizeOfTypeAllocated = DL.getTypeAllocSize(AI->getAllocatedType());
-			
-				auto *ObjSize = IRB.CreateMul(AI->getOperand(0),
-											ConstantInt::get(Type::getInt64Ty(F.getContext()), sizeOfTypeAllocated));
-				
-
-				if(basePtr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
-					basePtr = BitCastInst::Create(Instruction::CastOps::BitCast,
-												basePtr,
-												FunctionType::getInt8PtrTy(F.getContext()), 
-												"", insertBefore);
-				}
-				
-				auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast, 
-											ptr_Inst.first,
-											FunctionType::getInt8PtrTy(F.getContext()),
-											"", insertBefore);
-				
-				size_t accessSize = 0;
-
-				if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
-					accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
-				else
-					accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
-
-				auto BoundFn = F.getParent()->getOrInsertFunction("BoundsCheckWithSize",
-																FunctionType::getVoidTy(F.getContext()),
-																basePtr->getType(),
-																BI -> getType(),
-																ObjSize->getType(),
-																Type::getInt64Ty(F.getContext()));
-					
-				CallInst::Create(BoundFn,
-								{
-									basePtr, 
-									BI, 
-									ObjSize, 
-									ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false)
-								}, 
-								"", insertBefore);
-			}
-		}
-		else if(SI and isa<GEPOperator>(basePtr)){
-			// global ptr
-			auto *gepOperator = dyn_cast<GEPOperator>(basePtr);
-			basePtr = gepOperator -> getOperand(0);
-			IRBuilder<> IRB(SI);
-			
-			auto sizeOfTypeAllocated = DL.getTypeAllocSize(basePtr->getType()->getPointerElementType());
-
-			if(basePtr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
-				basePtr = BitCastInst::Create(Instruction::CastOps::BitCast, 
-											basePtr,
-											FunctionType::getInt8PtrTy(F.getContext()),
-											"", insertBefore);
-			}
-			
-			auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast,
-										ptr_Inst.first,
-										FunctionType::getInt8PtrTy(F.getContext()),
-										"", insertBefore);
-			
-			size_t accessSize = 0;
-
-			if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
-				accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
+			if(not IsAllocaInstVLA(AI, DL))
+				bytesAllocated = ConstantInt::get(Type::getInt64Ty(F.getContext()),
+												*AI->getAllocationSizeInBits(DL) / 8, 
+												false);
 			else
-				accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
+				bytesAllocated = IRBuilder<>(AI).CreateMul(AI->getOperand(0),
+														ConstantInt::get(Type::getInt64Ty(F.getContext()), 
+															DL.getTypeAllocSize(AI->getAllocatedType())));
+		}
+		else if(isa<StoreInst>(ptr_Inst.second) and isa<GEPOperator>(basePtr)){
+			// global ptr
+			basePtr = dyn_cast<GEPOperator>(basePtr)->getOperand(0);
+			bytesAllocated = ConstantInt::get(Type::getInt64Ty(F.getContext()), 
+											DL.getTypeAllocSize(basePtr->getType()->getPointerElementType()),
+											false);
+		}
+		else
+			needBoundCheckWithSize = false;
 
+		if(basePtr -> getType() != FunctionType::getInt8PtrTy(F.getContext()))
+			basePtr = insertBitCast(F, basePtr, insertBefore);
+		
+		auto *BI = insertBitCast(F, ptr_Inst.first, insertBefore);
+
+		size_t accessSize = 0;
+
+		if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
+			accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
+		else
+			accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
+
+		if(needBoundCheckWithSize){
 			auto BoundFn = F.getParent()->getOrInsertFunction("BoundsCheckWithSize",
 															FunctionType::getVoidTy(F.getContext()),
 															basePtr->getType(), 
 															BI -> getType(),
-															Type::getInt64Ty(F.getContext()),
+															bytesAllocated -> getType(),
 															Type::getInt64Ty(F.getContext()));
 			CallInst::Create(BoundFn,
 							{
 								basePtr,
 								BI,
-								ConstantInt::get(Type::getInt64Ty(F.getContext()), sizeOfTypeAllocated, false),
+								bytesAllocated,
 								ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false)
 							},
 							"", insertBefore);
-		
 		}
 		else{
-			if(basePtr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
-				basePtr = BitCastInst::Create(Instruction::CastOps::BitCast, 
-											basePtr,
-											FunctionType::getInt8PtrTy(F.getContext()),
-											"", insertBefore);
-			}
-			
-			auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast,
-										ptr_Inst.first,
-										FunctionType::getInt8PtrTy(F.getContext()),
-										"", insertBefore);
-			
-			size_t accessSize = 0;
-
-			if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
-				accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
-			else
-				accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
-
 			auto BoundFn = F.getParent()->getOrInsertFunction("BoundsCheck",
 															FunctionType::getVoidTy(F.getContext()),
 															basePtr->getType(),
