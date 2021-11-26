@@ -122,10 +122,9 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 	
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
-
-			if(auto *AI = dyn_cast<AllocaInst>(&I)){
-
-				if(isAllocaToMyMallocRequired(AI, F, TLI))
+			
+			AllocaInst *AI = dyn_cast<AllocaInst>(&I);
+			if(AI and isAllocaToMyMallocRequired(AI, F, TLI)){
 					allocaInstToBeConverted.insert(AI);
 			}
 		}
@@ -205,94 +204,68 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 	}
 }
 
+Value* findBasePtr(Value *ptr){
+	while(true){
+		if(auto *BI = dyn_cast<BitCastInst>(ptr))	
+			ptr = BI -> getOperand(0);
+		else if(auto *GI = dyn_cast<GetElementPtrInst>(ptr))	
+			ptr = GI -> getOperand(0);
+		else 	
+			break;
+	}
+	return ptr;
+}
+
 void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 	
-	std::set<std::pair<Value*, Value*>> pointersToTrack; // (ptr, Instruction above which check is needed)
+	// (ptr, Instruction above which check is needed)
+	std::set<std::pair<Value*, Value*>> pointersToTrack;
 	
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
 			
-			CallInst *CI = dyn_cast<CallInst>(&I);
-			if(CI && not isLibraryCall(CI, TLI) && CI->getCalledFunction()){
+			auto *CI = dyn_cast<CallInst>(&I);
+			if(CI and not isLibraryCall(CI, TLI) and CI->getCalledFunction()
+				  and not (CI->getCalledFunction()->getName() == "myfree")
+				  and not (CI->getCalledFunction()->getName() == "mymalloc")) {
 				
-				if(CI->getCalledFunction()->getName() == "myfree" || CI->getCalledFunction()->getName() == "mymalloc")
-					continue;
-
 				for(auto arg = CI -> arg_begin() ; arg != CI -> arg_end() ; arg++){
-					
-					if(arg->get()->getType()->isPointerTy()){
-					
-						if(DEBUG) {
-							errs() << "\nCall Instruction with pointer passed: " << *CI << "\n";
-							errs() << "Track this pointer: " << *arg->get() << "\n";
-						}
+					if(arg->get()->getType()->isPointerTy())
 						pointersToTrack.insert({arg->get(), CI});
-					}
 				}
 			}
 
-			ReturnInst *RI = dyn_cast<ReturnInst>(&I);
+			auto *RI = dyn_cast<ReturnInst>(&I);
 			if(RI && RI->getReturnValue() && RI->getReturnValue()->getType()->isPointerTy()){
-				
-				if(DEBUG) {
-					errs() << "\nReturn Instruction with pointer returned: " << *RI << "\n";
-					errs() << "Track this pointer: " << *RI->getReturnValue() << "\n";
-				}
-
 				pointersToTrack.insert({RI->getReturnValue(), RI});
 			}
 
-			StoreInst *SI = dyn_cast<StoreInst>(&I);
-			if(SI){
-
-				// TODO: track source or dst operand?
-				if(SI->getOperand(0)->getType()->isPointerTy()) {
-					if(DEBUG) {
-						errs() << "\nStore Instruction with pointer stored: " << *SI << "\n";
-						errs() << "Track this pointer: " << *SI->getOperand(0) << "\n";
-					}
-
-					pointersToTrack.insert({SI->getOperand(0), SI});
-				}
-
+			auto *SI = dyn_cast<StoreInst>(&I);
+			if(SI and SI->getOperand(0)->getType()->isPointerTy()){
+				pointersToTrack.insert({SI->getOperand(0), SI});
 			}
 		}
 	}
 	
-	for(std::pair<Value*, Value*> ptr_Inst: pointersToTrack){
-		
-		auto *ptr = ptr_Inst.first;
+	for(auto ptr_Inst: pointersToTrack){
+
+		auto *basePtr = findBasePtr(ptr_Inst.first);
 		Instruction *insertBefore = dyn_cast<Instruction>(ptr_Inst.second);
 
-		if(DEBUG)
-			errs() << "\n\nBackTracking: " << *ptr << "\n";
-
-		while(true){
-			if(auto *BI = dyn_cast<BitCastInst>(ptr)){
-				ptr = BI -> getOperand(0);
-			}
-			else if(auto *GI = dyn_cast<GetElementPtrInst>(ptr)){
-				ptr = GI -> getOperand(0);
-			}
-			else
-				break;
-			if(DEBUG)
-				errs() << *ptr << "\n";
+		if(basePtr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
+			basePtr = BitCastInst::Create(Instruction::CastOps::BitCast ,
+									basePtr,
+									FunctionType::getInt8PtrTy(F.getContext()),
+									"", insertBefore);
 		}
-
-		if(DEBUG)
-			errs() << "Base Ptr: " << *ptr << "\n";
-		
-		if(ptr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
-			ptr = BitCastInst::Create(Instruction::CastOps::BitCast , ptr, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
-		}
-		auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
-		
-		auto EscapeFn = F.getParent()->getOrInsertFunction("IsSafeToEscape", FunctionType::getVoidTy(F.getContext()) ,\
-							ptr->getType(), BI -> getType() );
-			
-		CallInst::Create(EscapeFn, {ptr, BI}, "", insertBefore);
-
+		auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , 
+									ptr_Inst.first,
+									FunctionType::getInt8PtrTy(F.getContext()), 
+									"", insertBefore);
+		auto EscapeFn = F.getParent()->getOrInsertFunction("IsSafeToEscape",
+														FunctionType::getVoidTy(F.getContext()),
+														basePtr->getType(), BI -> getType());
+		CallInst::Create(EscapeFn, {basePtr, BI}, "", insertBefore);
 	}
 }
 
