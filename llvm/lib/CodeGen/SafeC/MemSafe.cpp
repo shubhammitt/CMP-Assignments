@@ -169,7 +169,7 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 
 	// insert myfree corresponding to mymalloc for VLA Alloca
 	for(auto &callInstMalloc: callInstInserted_VLA) 
-					CallInst::Create(fnFree, callInstMalloc, "", CI_stackRestore);
+		CallInst::Create(fnFree, callInstMalloc, "", CI_stackRestore);
 }
 
 Value* findBasePtr(Value *ptr){
@@ -178,23 +178,31 @@ Value* findBasePtr(Value *ptr){
 			ptr = BI -> getOperand(0);
 		else if(auto *GI = dyn_cast<GetElementPtrInst>(ptr))	
 			ptr = GI -> getOperand(0);
-		else 	
+		else
 			break;
 	}
 	return ptr;
 }
 
+CastInst* insertBitCast(Function &F, Value *from, Instruction *insertBefore){
+	CastInst *BI = BitCastInst::Create(Instruction::CastOps::BitCast , 
+								from,
+								FunctionType::getInt8PtrTy(F.getContext()), 
+								"", insertBefore);
+	return BI;
+}
+
 void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 	
-	// (ptr, Instruction above which check is needed)
+	// (ptr, Instruction above which check is inserted)
 	std::set<std::pair<Value*, Value*>> pointersToTrack;
 	
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
 			
 			auto *CI = dyn_cast<CallInst>(&I);
-			if(CI and not isLibraryCall(CI, TLI) and CI->getCalledFunction()
-				  and not (CI->getCalledFunction()->getName() == "myfree")
+			if(CI and not isLibraryCall(CI, TLI) and CI->getCalledFunction()	\
+				  and not (CI->getCalledFunction()->getName() == "myfree")		\
 				  and not (CI->getCalledFunction()->getName() == "mymalloc")) {
 				
 				for(auto arg = CI -> arg_begin() ; arg != CI -> arg_end() ; arg++){
@@ -205,12 +213,12 @@ void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 
 			auto *RI = dyn_cast<ReturnInst>(&I);
 			if(RI && RI->getReturnValue() && RI->getReturnValue()->getType()->isPointerTy()){
-				pointersToTrack.insert({RI->getReturnValue(), RI});
+				pointersToTrack.insert({RI -> getReturnValue(), RI});
 			}
 
 			auto *SI = dyn_cast<StoreInst>(&I);
 			if(SI and SI->getOperand(0)->getType()->isPointerTy()){
-				pointersToTrack.insert({SI->getOperand(0), SI});
+				pointersToTrack.insert({SI -> getOperand(0), SI});
 			}
 		}
 	}
@@ -220,19 +228,15 @@ void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 		auto *basePtr = findBasePtr(ptr_Inst.first);
 		Instruction *insertBefore = dyn_cast<Instruction>(ptr_Inst.second);
 
-		if(basePtr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
-			basePtr = BitCastInst::Create(Instruction::CastOps::BitCast ,
-									basePtr,
-									FunctionType::getInt8PtrTy(F.getContext()),
-									"", insertBefore);
-		}
-		auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , 
-									ptr_Inst.first,
-									FunctionType::getInt8PtrTy(F.getContext()), 
-									"", insertBefore);
+		if(basePtr -> getType() != FunctionType::getInt8PtrTy(F.getContext()))
+			basePtr = insertBitCast(F, basePtr, insertBefore);
+		
+		auto *BI = insertBitCast(F, ptr_Inst.first, insertBefore);
+		
 		auto EscapeFn = F.getParent()->getOrInsertFunction("IsSafeToEscape",
 														FunctionType::getVoidTy(F.getContext()),
-														basePtr->getType(), BI -> getType());
+														basePtr -> getType(),
+														BI -> getType());
 		CallInst::Create(EscapeFn, {basePtr, BI}, "", insertBefore);
 	}
 }
