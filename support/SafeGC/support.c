@@ -38,25 +38,10 @@ void* mycast(void *Ptr, unsigned long long Bitmap, unsigned Size)
 void IsSafeToEscape(void *Base, void *Ptr)
 {
 	ObjHeader *objHeader = getObjectHeader((char*)Base);
-	// printf("%llu\n", objHeader->Type);
 	int objSize = objHeader->Size - OBJ_HEADER_SIZE;
 	char *objStart = (char*)objHeader + OBJ_HEADER_SIZE;
-	// printf("%p %p %ld %p %d\n", objStart, Ptr, (char*)Ptr - objStart, (objStart + objSize), objSize);
 	if((char*)Ptr < objStart || (((char*)Ptr) >= (objStart + objSize))){
-		printf("Disallowing out-of-bounds pointers\n");
-		exit(0);
-	}
-}
-
-void BoundsCheck(void *Base, void *Ptr, size_t AccessSize)
-{
-	ObjHeader *objHeader = getObjectHeader((char*)Base);
-	// printf("%llu\n", objHeader->Type);
-	int objSize = objHeader->Size - OBJ_HEADER_SIZE;
-	char *objStart = (char*)objHeader + OBJ_HEADER_SIZE;
-	// printf("%p %p %ld %p %d\n", objStart, Ptr, (char*)Ptr - objStart, (objStart + objSize), objSize);
-	if((char*)Ptr < objStart || (((char*)Ptr + AccessSize - 1) >= (objStart + objSize))){
-		printf("Adding BoundsCheck\n");
+		printf("Aborting due to disallowing out-of-bounds pointers\n");
 		exit(0);
 	}
 }
@@ -64,9 +49,17 @@ void BoundsCheck(void *Base, void *Ptr, size_t AccessSize)
 void BoundsCheckWithSize(void *RealBase, void *Ptr, size_t Size, size_t AccessSize)
 {
 	if(Ptr < RealBase || ((Ptr + AccessSize - 1) >= (RealBase + Size))){
-		printf("Adding BoundsCheck\n");
+		printf("Aborting due to BoundsCheck\n");
 		exit(0);
 	}
+}
+
+void BoundsCheck(void *Base, void *Ptr, size_t AccessSize)
+{
+	ObjHeader *objHeader = getObjectHeader((char*)Base);
+	int objSize = objHeader->Size - OBJ_HEADER_SIZE;
+	char *objStart = (char*)objHeader + OBJ_HEADER_SIZE;
+	BoundsCheckWithSize(objStart, Ptr, objSize, AccessSize);
 }
 
 int findPosLastSetBit(unsigned long long Type){
@@ -82,7 +75,6 @@ int findPosLastSetBit(unsigned long long Type){
 void WriteBarrierWithSize(void *RealBase, void *Ptr, size_t Size,
 	size_t AccessSize, unsigned long long Type)
 {
-	// printf("Hello  %lu %lu %lu %llu\n",Ptr - RealBase, Size, AccessSize, Type);
 	if(Type == 0)
 		return;
 	
@@ -91,15 +83,14 @@ void WriteBarrierWithSize(void *RealBase, void *Ptr, size_t Size,
 
 	int fieldNum = 0;
 	for(void *i = RealBase ; i < RealBase + Size - 8 ; i += 8, fieldNum = (fieldNum + 1) % numFields){
-		// printf("%lu %d %llu %llu\n", i - RealBase, fieldNum, Type, Type &(1<<fieldNum));
+		
 		if((Type & (1ULL << fieldNum)) != 0 && !((Ptr + AccessSize <= i) || (i + 8 <= Ptr))){
 			if((*(int64_t*)i) && ! getObjectHeader((char*)(*(int64_t*)i))){
-				printf("Write-Barrier\n");
+				printf("Aborting due to Write-Barrier\n");
 				exit(0);
 			}
 		}
 	}
-
 }
 
 void WriteBarrier(void *Base, void *Ptr, size_t AccessSize)
