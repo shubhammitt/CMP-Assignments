@@ -58,96 +58,75 @@ static bool isLibraryCall(const CallInst *CI, const TargetLibraryInfo *TLI)
 	return false;
 }
 
-bool DEBUG = true;
+bool DEBUG = false;
 
-bool isAllocaToMallocRequired(AllocaInst* AI, Function &F, const TargetLibraryInfo *TLI){
+/*
+ * from the given Alloca instruction, perform BFS on its users recursively 
+ * and if any of its descendants if passed to rountin or stored in memory
+ * then return true
+ */
+bool isAllocaToMyMallocRequired(AllocaInst* AI, Function &F, const TargetLibraryInfo *TLI){
 
-	// Do BFS
 	std::deque<Instruction*> q;
 	q.push_back(AI);
 
 	bool isPassedToRoutine = false;
-	bool isStoredInMemory = false;
+	bool isStoredInMemory  = false;
 
-	std::set<Value*> descendants;
-	descendants.insert(AI);
+	std::set<Value*> descendantsOfAlloca;
+	descendantsOfAlloca.insert(AI);
 
 	while(not q.empty()){
-		
-		Instruction *InstPopped = q.front();
+
+		Instruction *poppedInst = q.front();
 		q.pop_front();
 
-		for (auto *U : InstPopped -> users()) {
+		for (auto *U : poppedInst -> users()) {
 						
 			if (auto *CI = dyn_cast<CallInst>(U)) {
 				
-				if(isLibraryCall(CI, TLI))  // library calls are not analysed
-					continue;
+				if(isLibraryCall(CI, TLI)) continue; 		// library calls are not analysed
 
-				isPassedToRoutine = true;  // due to IR in SSA form, we need not to iterate over parametrs
-
-				if(DEBUG)
-					errs() << *CI << " breaking...";
-
+				isPassedToRoutine = true;  					// due to IR in SSA form, no need to iterate over parameters
 				q.clear();
 				break;
 			}
 
 			if(auto *SI = dyn_cast<StoreInst>(U)) {
 
-				if(not SI -> getValueOperand() -> getType() -> isPointerTy())
-					continue;
-
-				if(descendants.find(SI -> getValueOperand()) == descendants.end())
-					continue;
+				if(descendantsOfAlloca.find(SI -> getValueOperand()) == descendantsOfAlloca.end()) continue;
 
 				isStoredInMemory = true;
-				
-				if(DEBUG)
-					errs() << *SI << " breaking...";
-
 				q.clear();
 				break;
 			}
-							
-			if(auto *Inst = dyn_cast<Instruction>(U)) { 		// Fixme: What about branch instructions?
-				
+
+			if(auto *Inst = dyn_cast<Instruction>(U)) {
 				q.push_back(Inst);
-				descendants.insert(Inst);
-				
-				if(DEBUG)
-					errs() << *Inst << "  pushed in deque\n";
+				descendantsOfAlloca.insert(Inst);
 			}
 		}
 	}
 
-	if(DEBUG)
-		errs() << "\nAlloca requires conversion?: " \
-			   << ((isPassedToRoutine || isStoredInMemory)?"Yes":"No") << "\n\n\n";
-
 	return isPassedToRoutine || isStoredInMemory;
 }
 
+bool IsAllocaInstVLA(AllocaInst* AI, const DataLayout &DL){
+	return AI -> getAllocationSizeInBits(DL) == None;
+}
+
 void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
-	
-	/*
-	 * Stores all Alloca Instruction which need to be converted to mymalloc call
-	 */
-	std::set<AllocaInst*> allocaInstructionsToBeConverted;
+
+	// Stores all Alloca Instruction which need to be converted to mymalloc call
+	std::set<AllocaInst*> allocaInstToBeConverted;
 	
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
 
-			// if this is alloca Instruction then find its users recursivly using BFS
-			if(AllocaInst *AI = dyn_cast<AllocaInst>(&I)){
-				
-				if(DEBUG){
-					errs() << "\n\n***************** Doing BFS ***************\n";
-					errs() << I << "\n";
-				}
-				
-				if(isAllocaToMallocRequired(AI, F, TLI))
-					allocaInstructionsToBeConverted.insert(AI);
+			if(auto *AI = dyn_cast<AllocaInst>(&I)){
+
+				if(isAllocaToMyMallocRequired(AI, F, TLI))
+					allocaInstToBeConverted.insert(AI);
 			}
 		}
 	}
@@ -165,79 +144,61 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 	 */
 	const DataLayout &DL = F.getParent()->getDataLayout();
 	
-	/*
-	 * myFree need to pass argument given by the mymalloc call instruction inserted
-	 */
-	std::set<CallInst*> callInstructionsInsertedForNonVLA_Alloca;
-	std::set<CallInst*> callInstructionsInsertedForVLA_Alloca;
+	std::set<CallInst*> callInstInserted_NotVLA;
+	std::set<CallInst*> callInstInserted_VLA;
 
-	for(auto &AI: allocaInstructionsToBeConverted){
+	for(auto *AI: allocaInstToBeConverted){
 
-		if(DEBUG)
-			errs() << "Converting Alloca to mymalloc: " << *AI << "\n";
+		CallInst *callInstMalloc = NULL;
 
-		IRBuilder<> IRB(AI);
+		if(not IsAllocaInstVLA(AI, DL)) {
 
-		// check if current Alloca Instruction is VLA Alloca or not
-		if(AI -> getAllocationSizeInBits(DL)) { 					// Not VLA Alloca	
-
-			size_t bytesAllocated = (*AI->getAllocationSizeInBits(DL)) / 8;
-
-			if(DEBUG)
-				errs() << "It is Non-VLA Alloca, so size Allocated by Alloca: " << bytesAllocated << "\n";
-
-			auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", FunctionType::getInt8PtrTy(F.getContext()), \
-							Type::getInt64Ty(F.getContext())); // Fixeme: getType should be void* so bitcast is required from void* to alloca->getTpye
-			
-			auto *FI = CallInst::Create(FnMalloc, ConstantInt::get(Type::getInt64Ty(F.getContext()), \
-													bytesAllocated, false), "", AI);
-			auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , FI, AI->getType());
-			ReplaceInstWithInst(AI, BI);
-			callInstructionsInsertedForNonVLA_Alloca.insert(FI);
+			uint64_t bytesAllocated = *AI->getAllocationSizeInBits(DL) / 8;
+			auto fnMalloc = F.getParent()->getOrInsertFunction("mymalloc", 
+																FunctionType::getInt8PtrTy(F.getContext()),
+																Type::getInt64Ty(F.getContext()));
+			callInstMalloc = CallInst::Create(fnMalloc,
+								  			ConstantInt::get(Type::getInt64Ty(F.getContext()), bytesAllocated, false), 
+								  			"", AI);
+			callInstInserted_NotVLA.insert(callInstMalloc);
 		}
-		else {														// it is VLA Alloca
+		else {
 
-			auto sizeOfTypeAllocated = DL.getTypeAllocSize(AI->getAllocatedType());
+			uint64_t sizeOfTypeAllocated = DL.getTypeAllocSize(AI->getAllocatedType());
 			
-			Value *ObjSize = IRB.CreateMul( AI->getOperand(0), \
-				llvm::ConstantInt::get(llvm::Type::getInt64Ty(F.getContext()), sizeOfTypeAllocated));
-			
-			auto FnMalloc = F.getParent()->getOrInsertFunction("mymalloc", \
-							FunctionType::getInt8PtrTy(F.getContext()), ObjSize -> getType());
-			
-			auto *FI = CallInst::Create(FnMalloc, ObjSize, "", AI);
-			auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , FI, AI->getType());
-			ReplaceInstWithInst(AI, BI);
-			callInstructionsInsertedForVLA_Alloca.insert(FI);
-		}	
+			IRBuilder<> IRB(AI);
+			Value *ObjSize = IRB.CreateMul(AI->getOperand(0),
+										 ConstantInt::get(Type::getInt64Ty(F.getContext()),
+										 sizeOfTypeAllocated));
+			auto fnMalloc = F.getParent()->getOrInsertFunction("mymalloc",
+																FunctionType::getInt8PtrTy(F.getContext()), 
+																ObjSize -> getType());
+			callInstMalloc = CallInst::Create(fnMalloc, ObjSize, "", AI);
+			callInstInserted_VLA.insert(callInstMalloc);
+		}
+		auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast, callInstMalloc, AI->getType());
+		ReplaceInstWithInst(AI, BI);
 	}
 
-	/*
-	 * Insert myFree corresponding to mymalloc for NonVLA Alloca
-	 */
-	for(auto *callInstMalloc: callInstructionsInsertedForNonVLA_Alloca){
-		Instruction *lastInstruction = &(F.back().back());
-		auto FnFree = F.getParent()->getOrInsertFunction("myfree", Type::getVoidTy(F.getContext()), \
-						callInstMalloc->getType());
-		IRBuilder<> IRB(lastInstruction);
-		IRB.CreateCall(FnFree, {callInstMalloc});
-	}
+	Instruction *insertBefore = &(F.back().back());
+	auto FnFree = F.getParent()->getOrInsertFunction("myfree",
+													Type::getVoidTy(F.getContext()),
+													FunctionType::getInt8PtrTy(F.getContext()));
 
-	/*
-	 * Insert myFree corresponding to mymalloc for VLA Alloca
-	 */
+	// Insert myFree corresponding to mymalloc for NonVLA Alloca
+	for(auto *callInstMalloc: callInstInserted_NotVLA)
+		CallInst::Create(FnFree, callInstMalloc, "", insertBefore);
+
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
-			
-			CallInst *CI = dyn_cast<CallInst>(&I);
-			if(CI && CI->getCalledFunction() && CI->getCalledFunction()->getName() == "llvm.stackrestore"){
-				
-				for(auto &callInstMalloc: callInstructionsInsertedForVLA_Alloca) {
-					auto FnFree = F.getParent()->getOrInsertFunction("myfree", \
-									Type::getVoidTy(F.getContext()), callInstMalloc->getType());
-					IRBuilder<> IRB(&I);
-					IRB.CreateCall(FnFree, {callInstMalloc});
-				}
+	
+			CallInst *CI_stackRestore = dyn_cast<CallInst>(&I);
+			if(CI_stackRestore and CI_stackRestore->getCalledFunction() and \
+				CI_stackRestore->getCalledFunction()->getName() == "llvm.stackrestore"){	
+
+				// Insert myFree corresponding to mymalloc for VLA Alloca
+				for(auto &callInstMalloc: callInstInserted_VLA) 
+					CallInst::Create(FnFree, callInstMalloc, "", CI_stackRestore);
 				return;	
 			}
 		}
@@ -485,7 +446,7 @@ void addBoundsCheck(Function &F, const TargetLibraryInfo *TLI){
 unsigned long long computeBitMap(const DataLayout &DL, Type *Ty)
 {
 	SmallVector<LLT, 8> ValueVTs;
-SmallVector<uint64_t, 8> Offsets;
+	SmallVector<uint64_t, 8> Offsets;
 
 	computeValueLLTs(DL, *Ty, ValueVTs, &Offsets);
 	unsigned long long bitmap = 0;
@@ -513,14 +474,14 @@ SmallVector<uint64_t, 8> Offsets;
 
 void addWriteBarrier(Function &F, const TargetLibraryInfo *TLI){
 
-	if(DEBUG){
-		errs() << "\n\n**********************************************\nBefore Write Barrier" << "\n";
-		for (BasicBlock &BB : F) {
-			for (Instruction &I : BB) {
-				errs() << I << "\n";
-			}
-		}
-	}
+	// if(DEBUG){
+	// 	errs() << "\n\n**********************************************\nBefore Write Barrier" << "\n";
+	// 	for (BasicBlock &BB : F) {
+	// 		for (Instruction &I : BB) {
+	// 			errs() << I << "\n";
+	// 		}
+	// 	}
+	// }
 
 	if(DEBUG)
 		errs() << "\n\n\n\n\n\n\n Pointers To Track*********\n";
@@ -673,7 +634,7 @@ bool MemSafe::runOnFunction(Function &F) {
 	insertCheckForOutOfBoundPointer(F, TLI);
 	addBoundsCheck(F, TLI);
 	addWriteBarrier(F, TLI);
-  return true;
+	return true;
 }
 
 char MemSafe::ID = 0;
