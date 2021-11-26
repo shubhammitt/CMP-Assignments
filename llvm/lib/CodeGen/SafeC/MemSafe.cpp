@@ -143,15 +143,13 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 				allocaInstToBeConverted.insert(AI);
 
 			auto *CI = dyn_cast<CallInst>(&I);
-			if(CI and CI and CI->getCalledFunction() and CI->getCalledFunction()->getName() == "llvm.stackrestore")
+			if(CI and CI->getCalledFunction() and CI->getCalledFunction()->getName() == "llvm.stackrestore")
 				CI_stackRestore = CI;
 		}
 	}
 
 	const DataLayout &DL = F.getParent()->getDataLayout();
-	
-	std::set<CallInst*> callInstInserted_NotVLA;
-	std::set<CallInst*> callInstInserted_VLA;
+	std::set<CallInst*> callInstInserted_NotVLA, callInstInserted_VLA;
 
 	// add mymalloc in place of alloca
 	for(auto *AI: allocaInstToBeConverted){
@@ -167,16 +165,16 @@ void convertAllocaToMyMalloc(Function &F, const TargetLibraryInfo *TLI){
 		}
 	}
 
-	FunctionCallee fnFree = F.getParent()->getOrInsertFunction("myfree", getVoidTy(F), getInt8PtrTy(F));
+	auto fnFree = F.getParent()->getOrInsertFunction("myfree", getVoidTy(F), getInt8PtrTy(F));
 
 	// Insert myFree corresponding to mymalloc for NonVLA Alloca
 	Instruction *insertBeforeNonVLA = &(F.back().back());
 	for(auto *callInstMalloc: callInstInserted_NotVLA)
-		CallInst::Create(fnFree, callInstMalloc, "", insertBeforeNonVLA);
+		CallInst::Create(fnFree, {callInstMalloc}, "", insertBeforeNonVLA);
 
 	// insert myfree corresponding to mymalloc for VLA Alloca
 	for(auto &callInstMalloc: callInstInserted_VLA) 
-		CallInst::Create(fnFree, callInstMalloc, "", CI_stackRestore);
+		CallInst::Create(fnFree, {callInstMalloc}, "", CI_stackRestore);
 }
 
 Value* findBasePtr(Value *ptr){
@@ -191,7 +189,10 @@ Value* findBasePtr(Value *ptr){
 	return ptr;
 }
 
-CastInst* insertBitCast(Function &F, Value *from, Instruction *insertBefore){
+Value* insertBitCastIfNeeded(Function &F, Value *from, Instruction *insertBefore){
+	if(from -> getType() == getInt8PtrTy(F))
+		return from;
+
 	return BitCastInst::Create(Instruction::CastOps::BitCast, from, getInt8PtrTy(F), "", insertBefore);
 }
 
@@ -202,7 +203,7 @@ void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 	
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
-			
+
 			auto *CI = dyn_cast<CallInst>(&I);
 			if(CI and not isLibraryCall(CI, TLI) and CI->getCalledFunction()	\
 				  and not (CI->getCalledFunction()->getName() == "myfree")		\
@@ -215,30 +216,26 @@ void insertCheckForOutOfBoundPointer(Function &F, const TargetLibraryInfo *TLI){
 			}
 
 			auto *RI = dyn_cast<ReturnInst>(&I);
-			if(RI && RI->getReturnValue() && RI->getReturnValue()->getType()->isPointerTy()){
+			if(RI && RI->getReturnValue() && RI->getReturnValue()->getType()->isPointerTy())
 				pointersToTrack.insert({RI -> getReturnValue(), RI});
-			}
 
 			auto *SI = dyn_cast<StoreInst>(&I);
-			if(SI and SI->getOperand(0)->getType()->isPointerTy()){
+			if(SI and SI->getOperand(0)->getType()->isPointerTy())
 				pointersToTrack.insert({SI -> getOperand(0), SI});
-			}
 		}
 	}
 	
 	for(auto ptr_Inst: pointersToTrack){
 
-		auto *basePtr = findBasePtr(ptr_Inst.first);
+		Value *ptr = ptr_Inst.first;
+		auto *basePtr = findBasePtr(ptr);
 		Instruction *insertBefore = dyn_cast<Instruction>(ptr_Inst.second);
 
-		if(basePtr -> getType() != getInt8PtrTy(F))
-			basePtr = insertBitCast(F, basePtr, insertBefore);
-		
-		auto *BI = insertBitCast(F, ptr_Inst.first, insertBefore);
-		
-		auto EscapeFn = F.getParent()->getOrInsertFunction("IsSafeToEscape", getVoidTy(F), 
-														basePtr -> getType(), BI -> getType());
-		CallInst::Create(EscapeFn, {basePtr, BI}, "", insertBefore);
+		basePtr = insertBitCastIfNeeded(F, basePtr, insertBefore);	// convert baseptr to i8*
+		ptr = insertBitCastIfNeeded(F, ptr, insertBefore);
+
+		auto fnEscape = F.getParent()->getOrInsertFunction("IsSafeToEscape", getVoidTy(F), getInt8PtrTy(F), getInt8PtrTy(F));
+		CallInst::Create(fnEscape, {basePtr, ptr}, "", insertBefore);
 	}
 }
 
@@ -262,50 +259,50 @@ void addBoundsCheck(Function &F, const TargetLibraryInfo *TLI){
 
 	for(auto ptr_Inst: pointersToTrack){
 		
-		auto *basePtr = findBasePtr(ptr_Inst.first);
+		Value *ptr = ptr_Inst.first;
+		auto *basePtr = findBasePtr(ptr);
 		Instruction *insertBefore = dyn_cast<Instruction>(ptr_Inst.second);
-		bool needBoundCheckWithSize = true;
-		
+
+		bool needBoundsCheckWithSize = true;
 		Value *bytesAllocated = NULL;
 
 		if(auto *AI = dyn_cast<AllocaInst>(basePtr)){
 
-			if(not IsAllocaInstVLA(AI, DL))
-				bytesAllocated = getConstantInt(F, *AI->getAllocationSizeInBits(DL) / 8);
-			else
+			if(IsAllocaInstVLA(AI, DL))
 				bytesAllocated = IRBuilder<>(AI).CreateMul(AI->getOperand(0),
 														getConstantInt(F, DL.getTypeAllocSize(AI->getAllocatedType())));
+			else
+				bytesAllocated = getConstantInt(F, *AI->getAllocationSizeInBits(DL) / 8);
 		}
-		else if(isa<StoreInst>(ptr_Inst.second) and isa<GEPOperator>(basePtr)){
+
+		else if(isa<StoreInst>(insertBefore) and isa<GEPOperator>(basePtr)){
 			// global ptr
 			basePtr = dyn_cast<GEPOperator>(basePtr)->getOperand(0);
 			bytesAllocated = getConstantInt(F, DL.getTypeAllocSize(basePtr->getType()->getPointerElementType()));
 		}
 		else
-			needBoundCheckWithSize = false;
+			needBoundsCheckWithSize = false;
 
-		if(basePtr -> getType() != getInt8PtrTy(F))
-			basePtr = insertBitCast(F, basePtr, insertBefore);
-		
-		auto *BI = insertBitCast(F, ptr_Inst.first, insertBefore);
+		basePtr = insertBitCastIfNeeded(F, basePtr, insertBefore);
+		ptr = insertBitCastIfNeeded(F, ptr, insertBefore);
 
 		size_t accessSize = 0;
 
-		if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
+		if(auto *SI = dyn_cast<StoreInst>(insertBefore))
 			accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
 		else
-			accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
+			accessSize = DL.getTypeAllocSize(insertBefore->getType());
 
-		if(needBoundCheckWithSize){
+		if(needBoundsCheckWithSize){
 			auto BoundFn = F.getParent()->getOrInsertFunction("BoundsCheckWithSize", getVoidTy(F),
-															basePtr->getType(), BI -> getType(),
+															getInt8PtrTy(F), getInt8PtrTy(F),
 															bytesAllocated -> getType(), getInt64Ty(F));
-			CallInst::Create(BoundFn, {basePtr, BI, bytesAllocated, getConstantInt(F, accessSize)}, "", insertBefore);
+			CallInst::Create(BoundFn, {basePtr, ptr, bytesAllocated, getConstantInt(F, accessSize)}, "", insertBefore);
 		}
 		else{
 			auto BoundFn = F.getParent()->getOrInsertFunction("BoundsCheck", getVoidTy(F),
-															basePtr->getType(), BI -> getType(), getInt64Ty(F));
-			CallInst::Create(BoundFn, {basePtr, BI, getConstantInt(F, accessSize)}, "", insertBefore);
+															getInt8PtrTy(F), getInt8PtrTy(F), getInt64Ty(F));
+			CallInst::Create(BoundFn, {basePtr, ptr, getConstantInt(F, accessSize)}, "", insertBefore);
 		}
 	}
 }
@@ -352,21 +349,22 @@ void addWriteBarrierCheck(Function &F, const TargetLibraryInfo *TLI){
 	const DataLayout &DL = F.getParent()->getDataLayout();
 
 	for(auto ptr_Inst: pointersToTrack){
-		
-		auto *basePtr = findBasePtr(ptr_Inst.first);
+
+		Value *ptr = ptr_Inst.first;
+		auto *basePtr = findBasePtr(ptr);
 		Instruction *insertBefore = dyn_cast<Instruction>(dyn_cast<Instruction>(ptr_Inst.second)->getNextNode());
+
 		bool needWriteBarrierWithSize = true;
-		
 		unsigned long long type = 0;
 		Value *bytesAllocated = NULL;
 
 		if(auto *AI = dyn_cast<AllocaInst>(basePtr)){
 
-			if(not IsAllocaInstVLA(AI, DL))
-				bytesAllocated = getConstantInt(F, *AI->getAllocationSizeInBits(DL) / 8);
-			else
+			if(IsAllocaInstVLA(AI, DL))
 				bytesAllocated = IRBuilder<>(AI).CreateMul( AI->getOperand(0),
 											getConstantInt(F, DL.getTypeAllocSize(AI->getAllocatedType())));
+			else
+				bytesAllocated = getConstantInt(F, *AI->getAllocationSizeInBits(DL) / 8);
 
 			type = computeBitMap(DL, basePtr->getType()->getPointerElementType());
 		}
@@ -379,10 +377,8 @@ void addWriteBarrierCheck(Function &F, const TargetLibraryInfo *TLI){
 		else
 			needWriteBarrierWithSize = false;
 
-		if(basePtr -> getType() != getInt8PtrTy(F))
-			basePtr = insertBitCast(F, basePtr, insertBefore);
-		
-		auto *BI = insertBitCast(F, ptr_Inst.first, insertBefore);
+		basePtr = insertBitCastIfNeeded(F, basePtr, insertBefore);
+		ptr = insertBitCastIfNeeded(F, ptr, insertBefore);
 		
 		size_t accessSize = 0;
 
@@ -393,19 +389,18 @@ void addWriteBarrierCheck(Function &F, const TargetLibraryInfo *TLI){
 
 		if(needWriteBarrierWithSize){
 			auto WriteBarrierFn = F.getParent()->getOrInsertFunction("WriteBarrierWithSize", getVoidTy(F),
-															basePtr->getType(), BI -> getType(), 
+															getInt8PtrTy(F), getInt8PtrTy(F), 
 															bytesAllocated -> getType(), getInt64Ty(F), getInt64Ty(F));
 			CallInst::Create(WriteBarrierFn, 
-						{ basePtr, BI, bytesAllocated, getConstantInt(F, accessSize), getConstantInt(F, type) },
+						{ basePtr, ptr, bytesAllocated, getConstantInt(F, accessSize), getConstantInt(F, type) },
 						"", insertBefore);
 		}
 		else{
 			auto WriteBarrierFn = F.getParent()->getOrInsertFunction("WriteBarrier", getVoidTy(F),
-																basePtr->getType(), BI -> getType(), getInt64Ty(F));
-			CallInst::Create(WriteBarrierFn, {basePtr, BI, getConstantInt(F, accessSize)}, "", insertBefore);
+																getInt8PtrTy(F), getInt8PtrTy(F), getInt64Ty(F));
+			CallInst::Create(WriteBarrierFn, {basePtr, ptr, getConstantInt(F, accessSize)}, "", insertBefore);
 		}
 	}
-
 }
 
 bool MemSafe::runOnFunction(Function &F) {
