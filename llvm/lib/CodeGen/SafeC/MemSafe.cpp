@@ -266,6 +266,7 @@ void addBoundsCheck(Function &F, const TargetLibraryInfo *TLI){
 		bool needBoundCheckWithSize = true;
 		
 		Value *bytesAllocated = NULL;
+		
 		if(auto *AI = dyn_cast<AllocaInst>(basePtr)){
 
 			if(not IsAllocaInstVLA(AI, DL))
@@ -360,127 +361,99 @@ unsigned long long computeBitMap(const DataLayout &DL, Type *Ty)
 
 void addWriteBarrier(Function &F, const TargetLibraryInfo *TLI){
 
-	std::set<std::pair<Value*, Value*>> pointersToTrack; // (ptr, Instruction above which check is needed)
+	// (ptr, Instruction above which check is required)
+	std::set<std::pair<Value*, Value*>> pointersToTrack;
 
 	for (BasicBlock &BB : F) {
 		for (Instruction &I : BB) {
-			if(auto *SI = dyn_cast<StoreInst> (&I)){
+
+			if(auto *SI = dyn_cast<StoreInst> (&I))
 				pointersToTrack.insert({SI->getOperand(1), SI});
-			}
 		}
 	}
 
 	const DataLayout &DL = F.getParent()->getDataLayout();
 
-	for(std::pair<Value*, Value*> ptr_Inst: pointersToTrack){
+	for(auto ptr_Inst: pointersToTrack){
 		
-		auto *ptr = findBasePtr(ptr_Inst.first);
+		auto *basePtr = findBasePtr(ptr_Inst.first);
 		Instruction *insertBefore = dyn_cast<Instruction>(dyn_cast<Instruction>(ptr_Inst.second)->getNextNode());
+		bool needWriteBarrierWithSize = true;
 		
-		StoreInst *SI = dyn_cast<StoreInst>(ptr_Inst.second);
-		if(auto *AI = dyn_cast<AllocaInst>(ptr)){
+		unsigned long long type = 0;
+		Value *bytesAllocated = NULL;
 
-			if(not IsAllocaInstVLA(AI, DL)){
+		if(auto *AI = dyn_cast<AllocaInst>(basePtr)){
 
-				size_t Size = (*AI->getAllocationSizeInBits(DL)) / 8;
-
-				unsigned long long type = computeBitMap(DL, ptr->getType()->getPointerElementType());
-
-				if(ptr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
-					ptr = BitCastInst::Create(Instruction::CastOps::BitCast , ptr, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
-				}
-				
-				auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
-				
-				size_t accessSize = 0;
-				if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
-					accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
-				else
-					accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
-
-				auto BoundFn = F.getParent()->getOrInsertFunction("WriteBarrierWithSize", FunctionType::getVoidTy(F.getContext()) ,\
-									ptr->getType(), BI -> getType(), Type::getInt64Ty(F.getContext()), Type::getInt64Ty(F.getContext()), Type::getInt64Ty(F.getContext()));
-					
-				CallInst::Create(BoundFn, {ptr, BI, ConstantInt::get(Type::getInt64Ty(F.getContext()), Size, false), ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false), ConstantInt::get(Type::getInt64Ty(F.getContext()), type, false)}, "", insertBefore);
-			}
-			else{
-
-				IRBuilder<> IRB(AI);
-				auto sizeOfTypeAllocated = DL.getTypeAllocSize(AI->getAllocatedType());
-			
-				Value *ObjSize = IRB.CreateMul( AI->getOperand(0), \
-					ConstantInt::get(Type::getInt64Ty(F.getContext()), sizeOfTypeAllocated));
-				
-
-				unsigned long long type = computeBitMap(DL, ptr->getType()->getPointerElementType());
-
-				if(ptr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
-					ptr = BitCastInst::Create(Instruction::CastOps::BitCast , ptr, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
-				}
-				
-				auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
-				
-				size_t accessSize = 0;
-				if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
-					accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
-				else
-					accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
-
-				auto BoundFn = F.getParent()->getOrInsertFunction("WriteBarrierWithSize", FunctionType::getVoidTy(F.getContext()) ,\
-									ptr->getType(), BI -> getType(), ObjSize->getType(), Type::getInt64Ty(F.getContext()), Type::getInt64Ty(F.getContext()));
-					
-				CallInst::Create(BoundFn, {ptr, BI, ObjSize, ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false), ConstantInt::get(Type::getInt64Ty(F.getContext()), type, false)}, "", insertBefore);
-			}
-		}
-		else if(SI and isa<GEPOperator>(ptr)){
-			// global ptr
-			auto *gepOperator = dyn_cast<GEPOperator>(ptr);
-			ptr = gepOperator -> getOperand(0);
-			IRBuilder<> IRB(SI);
-			auto sizeOfTypeAllocated = DL.getTypeAllocSize(gepOperator->getOperand(0)->getType()->getPointerElementType());
-
-			unsigned long long type = computeBitMap(DL, ptr->getType()->getPointerElementType());
-
-			if(ptr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
-				ptr = BitCastInst::Create(Instruction::CastOps::BitCast , ptr, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
-			}
-			
-			auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
-			
-			size_t accessSize = 0;
-			if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
-				accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
+			if(not IsAllocaInstVLA(AI, DL))
+				bytesAllocated = ConstantInt::get(Type::getInt64Ty(F.getContext()), 
+											*AI->getAllocationSizeInBits(DL) / 8, 
+											false);
 			else
-				accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
+				bytesAllocated = IRBuilder<>(AI).CreateMul( AI->getOperand(0),
+											ConstantInt::get(Type::getInt64Ty(F.getContext()), DL.getTypeAllocSize(AI->getAllocatedType())));
 
-			auto BoundFn = F.getParent()->getOrInsertFunction("WriteBarrierWithSize", FunctionType::getVoidTy(F.getContext()) ,\
-								ptr->getType(), BI -> getType(), Type::getInt64Ty(F.getContext()), Type::getInt64Ty(F.getContext()), Type::getInt64Ty(F.getContext()));
-				
-			CallInst::Create(BoundFn, {ptr, BI, ConstantInt::get(Type::getInt64Ty(F.getContext()), sizeOfTypeAllocated, false), ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false), ConstantInt::get(Type::getInt64Ty(F.getContext()), type, false)}, "", insertBefore);
+			type = computeBitMap(DL, basePtr->getType()->getPointerElementType());
+		}
+		else if(isa<StoreInst>(ptr_Inst.second) and isa<GEPOperator>(basePtr)){
+			// global ptr
+			basePtr = dyn_cast<GEPOperator>(basePtr) -> getOperand(0);
+			bytesAllocated = ConstantInt::get(Type::getInt64Ty(F.getContext()), DL.getTypeAllocSize(basePtr->getType()->getPointerElementType()), false);
+
+			type = computeBitMap(DL, basePtr->getType()->getPointerElementType());
+		}
+		else
+			needWriteBarrierWithSize = false;
+
+		if(basePtr -> getType() != FunctionType::getInt8PtrTy(F.getContext()))
+			basePtr = insertBitCast(F, basePtr, insertBefore);
 		
+		auto *BI = insertBitCast(F, ptr_Inst.first, insertBefore);
+		
+		size_t accessSize = 0;
+
+		if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
+			accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
+		else
+			accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
+
+		if(needWriteBarrierWithSize){
+			auto BoundFn = F.getParent()->getOrInsertFunction("WriteBarrierWithSize", 
+														FunctionType::getVoidTy(F.getContext()) ,
+														basePtr->getType(), 
+														BI -> getType(), 
+														bytesAllocated -> getType(), 
+														Type::getInt64Ty(F.getContext()), 
+														Type::getInt64Ty(F.getContext()));
+			CallInst::Create(BoundFn, 
+						{
+							basePtr, 
+							BI, 
+							bytesAllocated, 
+							ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false), 
+							ConstantInt::get(Type::getInt64Ty(F.getContext()), type, false)
+						},
+						"", insertBefore);
 		}
 		else{
-			if(ptr -> getType() != FunctionType::getInt8PtrTy(F.getContext())){
-				ptr = BitCastInst::Create(Instruction::CastOps::BitCast , ptr, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
-			}
-			
-			auto *BI = BitCastInst::Create(Instruction::CastOps::BitCast , ptr_Inst.first, FunctionType::getInt8PtrTy(F.getContext()), "", insertBefore);
-			
-			size_t accessSize = 0;
-			if(auto *SI = dyn_cast<StoreInst>(ptr_Inst.second))
-				accessSize = DL.getTypeAllocSize(SI->getOperand(0)->getType());
-			else
-				accessSize = DL.getTypeAllocSize(ptr_Inst.second->getType());
-
-			auto BoundFn = F.getParent()->getOrInsertFunction("WriteBarrier", FunctionType::getVoidTy(F.getContext()) ,\
-								ptr->getType(), BI -> getType(), Type::getInt64Ty(F.getContext()));
+			auto BoundFn = F.getParent()->getOrInsertFunction("WriteBarrier", 
+														FunctionType::getVoidTy(F.getContext()),
+														basePtr->getType(),
+														BI -> getType(),
+														Type::getInt64Ty(F.getContext()));
 				
-			CallInst::Create(BoundFn, {ptr, BI, ConstantInt::get(Type::getInt64Ty(F.getContext()), \
-														accessSize, false)}, "", insertBefore);
+			CallInst::Create(BoundFn, 
+							{
+								basePtr, 
+								BI, 
+								ConstantInt::get(Type::getInt64Ty(F.getContext()), accessSize, false)
+							}, 
+							"", insertBefore);
 		}
 	}
 
 }
+
 bool MemSafe::runOnFunction(Function &F) {
 	TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
 	convertAllocaToMyMalloc(F, TLI);
