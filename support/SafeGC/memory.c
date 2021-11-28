@@ -1,76 +1,13 @@
 #define _GNU_SOURCE
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <string.h>
-#include <fcntl.h>
-#include <elf.h>
-#include <assert.h>
-#include <pthread.h>
 #include "memory.h"
-
-typedef unsigned long long ulong64;
-#define MAGIC_ADDR 0x12abcdef
-#define PATH_SZ 128
-
-#define SEGMENT_SIZE (4ULL << 32)
-#define PAGE_SIZE 4096
-#define METADATA_SIZE ((SEGMENT_SIZE/PAGE_SIZE) * 2)
-#define NUM_PAGES_IN_SEG (METADATA_SIZE/2)
-#define OTHER_METADATA_SIZE ((METADATA_SIZE/PAGE_SIZE) * 2)
-#define COMMIT_SIZE PAGE_SIZE
-#define Align(x, y) (((x) + (y-1)) & ~(y-1))
-#define ADDR_TO_PAGE(x) (char*)(((ulong64)(x)) & ~(PAGE_SIZE-1))
-#define ADDR_TO_SEGMENT(x) (Segment*)(((ulong64)(x)) & ~(SEGMENT_SIZE-1))
-#define FREE 1
-#define MARK 2
-#define GC_THRESHOLD (32ULL << 20)
 
 long long NumGCTriggered = 0;
 long long NumBytesFreed = 0;
 long long NumBytesAllocated = 0;
 extern char  etext, edata, end;
-
-struct OtherMetadata
-{
-	char *AllocPtr;
-	char *CommitPtr;
-	char *ReservePtr;
-	char *DataPtr;
-	int BigAlloc;
-};
-
-typedef struct Segment
-{
-	union
-	{
-		unsigned short Size[NUM_PAGES_IN_SEG];
-		struct OtherMetadata Other;
-	};
-} Segment;
-
-typedef struct SegmentList
-{
-	struct Segment *Segment;
-	struct SegmentList *Next;
-} SegmentList;
-
-typedef struct ObjHeader
-{
-	unsigned Size;
-	unsigned Status;
-	ulong64 Type;
-} ObjHeader;
-
-#define OBJ_HEADER_SIZE (sizeof(ObjHeader))
-
-
-static SegmentList *Segments = NULL;
+//static void myfree(void *Ptr);
+static void checkAndRunGC();
 
 static void setAllocPtr(Segment *Seg, char *Ptr) { Seg->Other.AllocPtr = Ptr; }
 static void setCommitPtr(Segment *Seg, char *Ptr) { Seg->Other.CommitPtr = Ptr; }
@@ -82,9 +19,6 @@ static char* getReservePtr(Segment *Seg) { return Seg->Other.ReservePtr; }
 static char* getDataPtr(Segment *Seg) { return Seg->Other.DataPtr; }
 static void setBigAlloc(Segment *Seg, int BigAlloc) { Seg->Other.BigAlloc = BigAlloc; }
 static int getBigAlloc(Segment *Seg) { return Seg->Other.BigAlloc; }
-static void myfree(void *Ptr);
-static void checkAndRunGC();
-
 static void addToSegmentList(Segment *Seg)
 {
 	SegmentList *L = malloc(sizeof(SegmentList));
@@ -173,6 +107,7 @@ static void createHole(Segment *Seg)
 		ObjHeader *Header = (ObjHeader*)AllocPtr;
 		Header->Size = HoleSz;
 		Header->Status = 0;
+		Header->Alignment = 0;
 		setAllocPtr(Seg, CommitPtr);
 		myfree(AllocPtr + OBJ_HEADER_SIZE);
 		NumBytesFreed -= HoleSz;
@@ -199,7 +134,7 @@ static void reclaimMemory(void *Ptr, size_t Size)
 }
 
 /* used by the GC to free objects. */
-static void myfree(void *Ptr)
+void myfree(void *Ptr)
 {
 	ObjHeader *Header = (ObjHeader*)((char*)Ptr - OBJ_HEADER_SIZE);
 	assert((Header->Status & FREE) == 0);
@@ -262,6 +197,7 @@ static void* BigAlloc(size_t Size)
 	ObjHeader *Header = (ObjHeader*)AllocPtr;
 	Header->Size = AlignedSize;
 	Header->Status = 0;
+	Header->Alignment = 0;
 	Header->Type = 0;
 	return AllocPtr + OBJ_HEADER_SIZE;
 }
@@ -269,6 +205,7 @@ static void* BigAlloc(size_t Size)
 
 void *_mymalloc(size_t Size)
 {
+	// printf("Allocated: %lu\n", Size);
 	size_t AlignedSize = Align(Size, 8) + OBJ_HEADER_SIZE;
 
 	NumBytesAllocated += AlignedSize;
@@ -312,6 +249,7 @@ void *_mymalloc(size_t Size)
 	ObjHeader *Header = (ObjHeader*)AllocPtr;
 	Header->Size = AlignedSize;
 	Header->Status = 0;
+	Header->Alignment = 0;
 	Header->Type = 0;
 	return AllocPtr + OBJ_HEADER_SIZE;
 }
@@ -487,7 +425,7 @@ static ObjHeader* ObjToHeader(void *Obj) { return (ObjHeader*)((char*)Obj - OBJ_
 unsigned GetSize(void *Obj)
 {
 	ObjHeader *Header = ObjToHeader(Obj);
-	return Header->Size - OBJ_HEADER_SIZE;
+	return (Header->Size) - OBJ_HEADER_SIZE;
 }
 
 unsigned long long GetType(void *Obj)
@@ -500,4 +438,62 @@ void SetType(void *Obj, unsigned long long Type)
 {
 	ObjHeader *Header = ObjToHeader(Obj);
 	Header->Type = Type;
+}
+
+void* GetAlignedAddr(void *Addr, size_t Alignment)
+{
+	ObjHeader *Header = ObjToHeader(Addr);
+	Header->Alignment = Alignment;
+	return (void*)Align((size_t)(Addr), Alignment);
+}
+
+int readArgv(const char* argv[], int idx)
+{
+	return atoi(argv[idx]);
+}
+
+int isPresentInSegmentList(char *addr) {
+	
+	SegmentList *head = Segments;
+	
+	while (head) {
+		
+		if (getDataPtr(head -> Segment) <= addr && addr <= getAllocPtr(head -> Segment))
+			return 1;
+		
+		head = head -> Next;
+	}
+	return 0;
+}
+
+ObjHeader* getObjectHeader(char *addr) {
+
+	if(isPresentInSegmentList(addr) == 0)
+		return NULL;
+	if (getBigAlloc(ADDR_TO_SEGMENT(addr))) {	/* Find objectHeader for bigAlloc */
+
+		char *myPage = ADDR_TO_PAGE(addr);
+		// iterate until first page of bigAlloc is reached
+		while (getSizeMetadata(myPage)[0] != 1) myPage -= PAGE_SIZE;
+		// return objectHeader if application contained reference 
+		// to object and not to its header(i.e >= mypage + 16)
+		if (myPage + 16 <= addr)
+			return (ObjHeader*)myPage;
+	}
+	else {										/* Find object header for smallAlloc*/
+
+		ObjHeader *objHeader = (ObjHeader*)ADDR_TO_PAGE(addr);				// first header of current page
+		
+		while (1) {
+			
+			if (addr < (char*)objHeader + OBJ_HEADER_SIZE)					// application contains reference to header and not object
+				return NULL;
+			
+			if (addr <= (char*)objHeader + objHeader -> Size)
+				return objHeader;
+			
+			objHeader = (ObjHeader*)((char*)objHeader + objHeader -> Size);	// jump to next Header in current page
+		}
+	}
+	return NULL;
 }
