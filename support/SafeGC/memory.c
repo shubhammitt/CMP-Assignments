@@ -171,6 +171,8 @@ void myfree(void *Ptr)
 static void* BigAlloc(size_t Size)
 {
 	size_t AlignedSize = Align(Size + OBJ_HEADER_SIZE, PAGE_SIZE);
+	NumBytesAllocated += AlignedSize;
+	checkAndRunGC(AlignedSize);
 	assert(AlignedSize <= SEGMENT_SIZE - METADATA_SIZE);
 	static Segment *CurSeg = NULL;
 	if (CurSeg == NULL)
@@ -205,15 +207,13 @@ static void* BigAlloc(size_t Size)
 
 void *_mymalloc(size_t Size)
 {
-	// printf("Allocated: %lu\n", Size);
 	size_t AlignedSize = Align(Size, 8) + OBJ_HEADER_SIZE;
 
-	NumBytesAllocated += AlignedSize;
-	checkAndRunGC(AlignedSize);
 	if (AlignedSize > COMMIT_SIZE)
 	{
 		return BigAlloc(Size);
 	}
+	checkAndRunGC(AlignedSize);
 	assert(Size != 0);
 	assert(sizeof(struct OtherMetadata) <= OTHER_METADATA_SIZE);
 	assert(sizeof(struct Segment) == METADATA_SIZE);
@@ -245,6 +245,7 @@ void *_mymalloc(size_t Size)
 		}
 	}
 
+	NumBytesAllocated += AlignedSize;
 	setAllocPtr(CurSeg, NewAllocPtr);
 	ObjHeader *Header = (ObjHeader*)AllocPtr;
 	Header->Size = AlignedSize;
@@ -254,27 +255,186 @@ void *_mymalloc(size_t Size)
 	return AllocPtr + OBJ_HEADER_SIZE;
 }
 
-/* scan objects in the scanner list.
- * add newly encountered unmarked objects 
- * to the scanner list after marking them.
- */
-void scanner()
-{
+
+/************************************************************************************************
+ * for storing reference to the header of reachable objects in the form of singly linked list 	*
+ ************************************************************************************************/
+typedef struct UnscannedList {
+	unsigned char *objHeader;
+	struct UnscannedList *next;
+} UnscannedList;
+
+UnscannedList *UnscannedListHead = NULL;
+UnscannedList *UnscannedListTail = NULL;
+
+
+/************************************************************************************************
+ * 							adds new node at the end of list i.e. tail 							*
+ ************************************************************************************************/
+void addToUnscannedList(unsigned char *objHeader) {
+	
+	UnscannedList *node = (UnscannedList*)malloc(sizeof(UnscannedList));
+	if (node == NULL) {
+		printf("Unable to allocate list node\n");
+		exit(0);
+	}
+	node -> next = NULL;
+	node -> objHeader = objHeader;
+
+	if (UnscannedListHead == NULL)
+		UnscannedListHead = node;
+	else
+		UnscannedListTail -> next = node;
+	UnscannedListTail = node;
 }
 
-/* Free all unmarked objects. */
-void sweep()
-{
+
+/************************************************************************************************
+ * Idea:																						*
+ *		We can iterate over segments stored in SegmentList. 									*
+ * 		In each segment, iterate from dataptr to allocptr. Since myfree stores the amount of	*
+ *		memory free for each page, we can use it to know whether current page is free or not.	*
+ * 		If free, then move to next page. Otherwise, start of the page will contain the 			*
+ * 		objectHeader and using that we will free the object depending on its Status bit and 	*
+ * 		move to next Header using the size of object stored in current objectHeader.			*
+ ************************************************************************************************/
+void sweep() {
+	
+	SegmentList *segHead = Segments;
+	while (segHead) {
+		
+		char *startptr = getDataPtr(segHead -> Segment);
+		char *endptr = getAllocPtr(segHead -> Segment);
+
+		while(startptr < endptr) {
+			
+			if (getSizeMetadata(ADDR_TO_PAGE(startptr))[0] < PAGE_SIZE) {
+				
+				ObjHeader *objHeader = (ObjHeader*)(startptr);
+				startptr += objHeader -> Size;						// cannot be done later since page might be freed
+				
+				if(objHeader -> Status == 0){				
+					myfree((void*)objHeader + OBJ_HEADER_SIZE);		// object is not reachable, so free it
+				}
+				else if(objHeader -> Status == MARK) 		
+					objHeader -> Status = 0;						// object is reachable so cannot be freed, unmark it
+			}
+			else										
+				startptr = ADDR_TO_PAGE(startptr) + PAGE_SIZE;		// page is already free, go to next page
+		}
+		segHead = segHead -> Next;									// go to next Segment
+	}
 }
 
-/* walk all 4-byte aligned addresses.
- * add unmarked valid objects to the 
- * scanner list after marking them
- * for scanning.
- */
-static void scanRoots(unsigned *Top, unsigned *Bottom)
-{
+
+/************************************************************************************************
+ * returns whether address lies in between Data Ptr and Alloc Ptr of some segment 				*
+ ************************************************************************************************/
+int isPresentInSegmentList(char *addr) {
+	
+	SegmentList *head = Segments;
+	
+	while (head) {
+		
+		if (getDataPtr(head -> Segment) <= addr && addr <= getAllocPtr(head -> Segment))
+			return 1;
+		
+		head = head -> Next;
+	}
+	return 0;
 }
+
+/************************************************************************************************
+ * returns: objectHeader corresponding to the object's reference stored in pointer: char *addr 	*
+ *			returns NULL for invalid addresses 													*
+ * Idea: 				 				 				 										*
+ * 		Object's size >  PAGE_SIZE:  				 											*
+ * 			"The metadata corresponding to the first page of a big allocation is set to one to 	*
+ * 			identify the first byte of these objects." We exploit this feature to find the 		*
+ * 			first page of big allocation which in turn stores the objectHeader corresponding 	*
+ * 			to the given object at the top of that page. We do this by finding the page 		*
+ * 			containing address stored in 'addr' and if the byte is not to set to one then we 	*
+ * 			move on to previous page and repeat the same until we reach the first page and then *
+ *  		return the objectHeader stored at top of this page. 								*
+ *		Object's size <= PAGE_SIZE:																*
+ * 			Since an object+its header lies on single page, we can find the page of given 		*
+ * 			object. Also, we know that start of the page contains object header, may be of some *
+ * 			other object, we can iterate on all object headers in current page using the size 	*
+ * 			of object stored in object header which will help in finding next object Header in 	*
+ * 			current	page and ultimately finding the header corresponding to given object. 		*
+ ************************************************************************************************/
+ObjHeader* getObjectHeader(char *addr) {
+
+	if(isPresentInSegmentList(addr) == 0)
+		return NULL;
+
+	if (getBigAlloc(ADDR_TO_SEGMENT(addr))) {	/* Find objectHeader for bigAlloc */
+
+		char *myPage = ADDR_TO_PAGE(addr);
+		// iterate until first page of bigAlloc is reached
+		while (getSizeMetadata(myPage)[0] != 1) myPage -= PAGE_SIZE;
+		// return objectHeader if application contained reference 
+		// to object and not to its header(i.e >= mypage + 16)
+		if (myPage + 16 <= addr)
+			return (ObjHeader*)myPage;
+	}
+	else {										/* Find object header for smallAlloc*/
+
+		ObjHeader *objHeader = (ObjHeader*)ADDR_TO_PAGE(addr);				// first header of current page
+		
+		while (1) {
+			
+			if (addr < (char*)objHeader + OBJ_HEADER_SIZE)					// application contains reference to header and not object
+				return NULL;
+			
+			if (addr <= (char*)objHeader + objHeader -> Size)
+				return objHeader;
+			
+			objHeader = (ObjHeader*)((char*)objHeader + objHeader -> Size);	// jump to next Header in current page
+		}
+	}
+	return NULL;
+}
+
+
+/************************************************************************************************ 
+ * walk all addresses in the range [Top, Bottom-8].												*
+ * add unmarked valid objects to the scanner list after marking them for scanning.				*
+ ************************************************************************************************/
+static void scanRoots(unsigned char *Top, unsigned char *Bottom) {	// top < bottom	
+	
+	Bottom -= 8;
+	for (unsigned char *addr = Top ; addr <= Bottom ;  addr++) {
+		
+		char *valueAtAddr = (char*)(*((ulong64*)addr));
+		ObjHeader *objHeader = getObjectHeader(valueAtAddr);
+		
+		if (objHeader && objHeader -> Status == 0) { 					// if object is not marked/free
+			objHeader -> Status = MARK;
+			addToUnscannedList((unsigned char*)objHeader);
+		}
+	}
+}
+
+
+/************************************************************************************************
+ * scan objects in the scanner list.															*
+ * add newly encountered unmarked objects 														*
+ * to the not scanned list after marking them.														*
+ ************************************************************************************************/
+static void scanner() {
+	UnscannedList *nextHead = NULL;
+	while (UnscannedListHead) {
+		
+		scanRoots(UnscannedListHead -> objHeader + OBJ_HEADER_SIZE, 
+				  UnscannedListHead -> objHeader + ((ObjHeader*)UnscannedListHead -> objHeader) -> Size);
+		
+		nextHead = UnscannedListHead -> next;
+		free(UnscannedListHead);
+		UnscannedListHead = nextHead;
+	}
+}
+
 
 static size_t
 getDataSecSz()
@@ -345,23 +505,23 @@ void _runGC()
 	NumGCTriggered++;
 
 	size_t DataSecSz = getDataSecSz();
-	unsigned *DataStart;
+	unsigned char *DataStart;
 
 	if (DataSecSz == -1)
 	{
-		DataStart = (unsigned*)Align(((ulong64)&etext), 4);
+		DataStart = (unsigned char*)&etext;
 	}
 	else
 	{
-		DataStart = (unsigned*)Align(((ulong64)(&edata - DataSecSz)), 4);
+		DataStart = (unsigned char*)((char*)&edata - DataSecSz);
 	}
-	unsigned *DataEnd = (unsigned*)((ulong64)(&edata) - 7);
+	unsigned char *DataEnd = (unsigned char*)(&edata);
 
 	/* scan global variables */
 	scanRoots(DataStart, DataEnd);
 
-	unsigned *UnDataStart = (unsigned*)Align(((ulong64)&edata), 4);
-	unsigned *UnDataEnd = (unsigned*)((ulong64)(&end) - 7);
+	unsigned char *UnDataStart = (unsigned char*)(&edata);
+	unsigned char *UnDataEnd = (unsigned char*)(&end);
 
 	/* scan uninitialized global variables */
 	scanRoots(UnDataStart, UnDataEnd);
@@ -384,11 +544,10 @@ void _runGC()
 		printf("Error getting stackinfo\n");
 		return;
 	}
-	unsigned *Bottom = (unsigned*)(Base + Size - 7);
-	unsigned *Top = (unsigned*)&Lvar;
-	Top = (unsigned*)Align((ulong64)Top, 4);
+	unsigned char *Bottom = (unsigned char*)(Base + Size);
+	unsigned char *Top = (unsigned char*)&Lvar;
 	/* skip GC stack frame */
-	while (Top[0] != MAGIC_ADDR)
+	while (*((unsigned*)Top) != MAGIC_ADDR)
 	{
 		assert(Top < Bottom);
 		Top++;
@@ -450,50 +609,4 @@ void* GetAlignedAddr(void *Addr, size_t Alignment)
 int readArgv(const char* argv[], int idx)
 {
 	return atoi(argv[idx]);
-}
-
-int isPresentInSegmentList(char *addr) {
-	
-	SegmentList *head = Segments;
-	
-	while (head) {
-		
-		if (getDataPtr(head -> Segment) <= addr && addr <= getAllocPtr(head -> Segment))
-			return 1;
-		
-		head = head -> Next;
-	}
-	return 0;
-}
-
-ObjHeader* getObjectHeader(char *addr) {
-
-	if(isPresentInSegmentList(addr) == 0)
-		return NULL;
-	if (getBigAlloc(ADDR_TO_SEGMENT(addr))) {	/* Find objectHeader for bigAlloc */
-
-		char *myPage = ADDR_TO_PAGE(addr);
-		// iterate until first page of bigAlloc is reached
-		while (getSizeMetadata(myPage)[0] != 1) myPage -= PAGE_SIZE;
-		// return objectHeader if application contained reference 
-		// to object and not to its header(i.e >= mypage + 16)
-		if (myPage + 16 <= addr)
-			return (ObjHeader*)myPage;
-	}
-	else {										/* Find object header for smallAlloc*/
-
-		ObjHeader *objHeader = (ObjHeader*)ADDR_TO_PAGE(addr);				// first header of current page
-		
-		while (1) {
-			
-			if (addr < (char*)objHeader + OBJ_HEADER_SIZE)					// application contains reference to header and not object
-				return NULL;
-			
-			if (addr <= (char*)objHeader + objHeader -> Size)
-				return objHeader;
-			
-			objHeader = (ObjHeader*)((char*)objHeader + objHeader -> Size);	// jump to next Header in current page
-		}
-	}
-	return NULL;
 }

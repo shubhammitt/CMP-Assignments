@@ -96,7 +96,7 @@ static void interconnects__inner(Node nodes[], int src_idx)
 	}
 }
 
-static void interconnects(Node nodes[])
+static void __attribute__((noinline)) interconnects(Node nodes[])
 {
 	for (int i = 0; i < num_nodes; i++)
 	{
